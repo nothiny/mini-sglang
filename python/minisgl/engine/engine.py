@@ -52,6 +52,7 @@ class Engine:
         self.model.load_state_dict(self._load_weight_state_dict(config))
 
         # ======================= KV cache initialization ========================
+        self.kv_bytes_per_token = _get_kv_bytes_per_token(config)
         self.num_pages = self._determine_num_pages(init_free_memory, config)
         num_tokens = self.num_pages * config.page_size
         self.ctx.kv_cache = self.kv_cache = create_kvcache_pool(
@@ -147,14 +148,7 @@ class Engine:
 
     def _determine_num_pages(self, old_free_memory: int, config: EngineConfig) -> int:
         new_free_memory = self._sync_get_memory()[1]
-        cache_per_page = (
-            2  # key + value
-            * config.model_config.head_dim
-            * div_even(config.model_config.num_kv_heads, config.tp_info.size, allow_replicate=True)
-            * config.page_size
-            * self.dtype.itemsize
-            * config.model_config.num_layers
-        )
+        cache_per_page = self.kv_bytes_per_token * config.page_size
         num_pages = config.num_page_override
         if num_pages is None:
             model_memory = old_free_memory - new_free_memory
@@ -213,6 +207,16 @@ class Engine:
 
 def _align_up_32(num: int) -> int:
     return (num + 31) // 32 * 32
+
+
+def _get_kv_bytes_per_token(config: EngineConfig) -> int:
+    return (
+        2  # key + value
+        * config.model_config.head_dim
+        * div_even(config.model_config.num_kv_heads, config.tp_info.size, allow_replicate=True)
+        * config.dtype.itemsize
+        * config.model_config.num_layers
+    )
 
 
 def _adjust_config(config: EngineConfig):

@@ -62,7 +62,7 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         EngineConfig instance with parsed arguments
     """
     from minisgl.attention import validate_attn_backend
-    from minisgl.kvcache import SUPPORTED_CACHE_MANAGER
+    from minisgl.kvcache import SUPPORTED_CACHE_MANAGER, SUPPORTED_EVICTION_POLICIES
     from minisgl.moe import SUPPORTED_MOE_BACKENDS
 
     parser = argparse.ArgumentParser(description="MiniSGL Server Arguments")
@@ -204,10 +204,72 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
 
     parser.add_argument(
         "--cache-type",
+        "--cache",
         type=str,
         default=ServerArgs.cache_type,
         choices=SUPPORTED_CACHE_MANAGER.supported_names(),
         help="The KV cache management strategy.",
+    )
+
+    parser.add_argument(
+        "--cache-eviction-policy",
+        type=str,
+        default=ServerArgs.cache_eviction_policy,
+        choices=SUPPORTED_EVICTION_POLICIES.supported_names(),
+        help="The victim-selection policy used by the Radix prefix cache.",
+    )
+
+    parser.add_argument(
+        "--eviction-k",
+        type=int,
+        default=ServerArgs.eviction_k,
+        help="Number of recent accesses retained by the lru-k policy.",
+    )
+
+    parser.add_argument(
+        "--eviction-half-life",
+        type=float,
+        default=ServerArgs.eviction_half_life,
+        help="Frequency/recency half-life in seconds for decay and cost-aware policies.",
+    )
+
+    parser.add_argument(
+        "--eviction-ghost-capacity",
+        type=int,
+        default=ServerArgs.eviction_ghost_capacity,
+        help="Maximum number of evicted prefix fingerprints retained for feedback.",
+    )
+
+    def parse_adaptive_experts(value: str) -> Tuple[str, ...]:
+        experts = tuple(name.strip() for name in value.split(",") if name.strip())
+        if not experts:
+            raise argparse.ArgumentTypeError("adaptive experts cannot be empty")
+        SUPPORTED_EVICTION_POLICIES.assert_supported(experts)
+        if "adaptive" in experts:
+            raise argparse.ArgumentTypeError("adaptive cannot contain itself as an expert")
+        if len(set(experts)) != len(experts):
+            raise argparse.ArgumentTypeError("adaptive expert names must be unique")
+        return experts
+
+    parser.add_argument(
+        "--adaptive-experts",
+        type=parse_adaptive_experts,
+        default=ServerArgs.adaptive_experts,
+        help="Comma-separated experts used by the adaptive policy.",
+    )
+
+    parser.add_argument(
+        "--adaptive-learning-rate",
+        type=float,
+        default=ServerArgs.adaptive_learning_rate,
+        help="Regret-learning rate used by the adaptive policy.",
+    )
+
+    parser.add_argument(
+        "--adaptive-seed",
+        type=int,
+        default=ServerArgs.adaptive_seed,
+        help="Random seed for reproducible adaptive expert selection.",
     )
 
     parser.add_argument(
@@ -263,6 +325,10 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     del kwargs["tensor_parallel_size"]
 
     result = ServerArgs(**kwargs)
+    try:
+        result.eviction_policy_config
+    except ValueError as error:
+        parser.error(str(error))
     logger = init_logger(__name__)
     logger.info(f"Parsed arguments:\n{result}")
     return result, run_shell

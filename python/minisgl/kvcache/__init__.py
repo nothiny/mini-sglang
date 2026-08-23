@@ -15,10 +15,32 @@ from .base import (
     MatchResult,
     SizeInfo,
 )
+from .eviction import (
+    SUPPORTED_EVICTION_POLICIES,
+    AdaptivePolicy,
+    BaseEvictionPolicy,
+    CostAwarePolicy,
+    EvictionCandidate,
+    EvictionContext,
+    EvictionPolicyConfig,
+    FrequencyDecayPolicy,
+    LFUPolicy,
+    LRUKPolicy,
+    LRUPolicy,
+    create_eviction_policy,
+)
 
 
 class CacheManagerCreator(Protocol):
-    def __call__(self, device: torch.device) -> BasePrefixCache: ...
+    def __call__(
+        self,
+        device: torch.device,
+        *,
+        eviction_policy: BaseEvictionPolicy | None = None,
+        eviction_policy_config: EvictionPolicyConfig | None = None,
+        total_tokens: int = 0,
+        kv_bytes_per_token: int = 1,
+    ) -> BasePrefixCache: ...
 
 
 SUPPORTED_CACHE_MANAGER = Registry[CacheManagerCreator]("Cache Manager")
@@ -45,21 +67,57 @@ def create_kvcache_pool(
 
 
 @SUPPORTED_CACHE_MANAGER.register("naive")
-def create_naive_cache(device: torch.device):
+def create_naive_cache(
+    device: torch.device,
+    *,
+    eviction_policy: BaseEvictionPolicy | None = None,
+    eviction_policy_config: EvictionPolicyConfig | None = None,
+    total_tokens: int = 0,
+    kv_bytes_per_token: int = 1,
+) -> BasePrefixCache:
     from .naive_cache import NaivePrefixCache
 
     return NaivePrefixCache(device=device)
 
 
 @SUPPORTED_CACHE_MANAGER.register("radix")
-def create_radix_cache(device: torch.device):
+def create_radix_cache(
+    device: torch.device,
+    *,
+    eviction_policy: BaseEvictionPolicy | None = None,
+    eviction_policy_config: EvictionPolicyConfig | None = None,
+    total_tokens: int = 0,
+    kv_bytes_per_token: int = 1,
+) -> BasePrefixCache:
     from .radix_cache import RadixPrefixCache
 
-    return RadixPrefixCache(device=device)
+    policy_config = eviction_policy_config or EvictionPolicyConfig()
+    policy = eviction_policy or create_eviction_policy(config=policy_config)
+    return RadixPrefixCache(
+        device=device,
+        eviction_policy=policy,
+        total_tokens=total_tokens,
+        kv_bytes_per_token=kv_bytes_per_token,
+        ghost_capacity=policy_config.ghost_capacity,
+    )
 
 
-def create_prefix_cache(device: torch.device, type: str) -> BasePrefixCache:
-    return SUPPORTED_CACHE_MANAGER[type](device)
+def create_prefix_cache(
+    device: torch.device,
+    type: str,
+    *,
+    eviction_policy: BaseEvictionPolicy | None = None,
+    eviction_policy_config: EvictionPolicyConfig | None = None,
+    total_tokens: int = 0,
+    kv_bytes_per_token: int = 1,
+) -> BasePrefixCache:
+    return SUPPORTED_CACHE_MANAGER[type](
+        device,
+        eviction_policy=eviction_policy,
+        eviction_policy_config=eviction_policy_config,
+        total_tokens=total_tokens,
+        kv_bytes_per_token=kv_bytes_per_token,
+    )
 
 
 __all__ = [
@@ -68,7 +126,19 @@ __all__ = [
     "BaseKVCachePool",
     "BaseCacheHandle",
     "BasePrefixCache",
+    "AdaptivePolicy",
+    "BaseEvictionPolicy",
+    "CostAwarePolicy",
+    "EvictionCandidate",
+    "EvictionContext",
+    "EvictionPolicyConfig",
+    "FrequencyDecayPolicy",
+    "LFUPolicy",
+    "LRUKPolicy",
+    "LRUPolicy",
     "SizeInfo",
     "MatchResult",
     "SUPPORTED_CACHE_MANAGER",
+    "SUPPORTED_EVICTION_POLICIES",
+    "create_eviction_policy",
 ]

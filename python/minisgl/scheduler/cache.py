@@ -5,7 +5,13 @@ from typing import TYPE_CHECKING, List, Tuple
 
 import torch
 from minisgl.core import Req
-from minisgl.kvcache import BaseCacheHandle, MatchResult, create_prefix_cache
+from minisgl.kvcache import (
+    BaseCacheHandle,
+    BaseEvictionPolicy,
+    EvictionPolicyConfig,
+    MatchResult,
+    create_prefix_cache,
+)
 from minisgl.utils import div_ceil
 
 if TYPE_CHECKING:
@@ -13,12 +19,29 @@ if TYPE_CHECKING:
 
 
 class CacheManager:
-    def __init__(self, num_pages: int, page_size: int, page_table: torch.Tensor, type: str):
+    def __init__(
+        self,
+        num_pages: int,
+        page_size: int,
+        page_table: torch.Tensor,
+        type: str,
+        *,
+        eviction_policy: BaseEvictionPolicy | None = None,
+        eviction_policy_config: EvictionPolicyConfig | None = None,
+        kv_bytes_per_token: int = 1,
+    ) -> None:
         # The `_free_slots` follows a page-aligned manner. For example, if page_size = 2,
         # the `_free_slots` may look like [0, 2, 4, 6, ...], and each slot represents a page.
         device = page_table.device
         self.free_slots = torch.arange(num_pages, dtype=torch.int32, device=device) * page_size
-        self.prefix_cache = create_prefix_cache(device=device, type=type)
+        self.prefix_cache = create_prefix_cache(
+            device=device,
+            type=type,
+            eviction_policy=eviction_policy,
+            eviction_policy_config=eviction_policy_config,
+            total_tokens=num_pages * page_size,
+            kv_bytes_per_token=kv_bytes_per_token,
+        )
         self.device = device
         self.num_pages = num_pages
         self.page_table = page_table

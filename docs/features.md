@@ -51,6 +51,22 @@ Adopting the original design from [SGLang](https://github.com/sgl-project/sglang
 ![radix](https://lmsys.org/images/blog/sglang/radix_attn.jpg)
 *Illustration of Radix Attention from [LMSYS Blog](https://lmsys.org/blog/2024-01-17-sglang/).*
 
+### Eviction Policies
+
+Radix tree correctness and victim selection are separated through a unified event-driven policy
+interface. Mini-SGLang includes LRU, LFU, LRU-K, frequency-decay, cost-aware, and adaptive expert
+policies. Select one with `--cache-eviction-policy`; for example:
+
+```bash
+python -m minisgl --model Qwen/Qwen3-0.6B \
+  --cache radix \
+  --cache-eviction-policy adaptive \
+  --adaptive-experts lru,lfu,cost-aware
+```
+
+See [Radix Cache Eviction Policies](./eviction_policies.md) for all parameters, policy semantics,
+and the Python injection interface.
+
 ## Overlap Scheduling
 
 To further reduce CPU overhead, Mini-SGLang employs overlap scheduling, a technique proposed in [NanoFlow](https://arxiv.org/abs/2408.12757). This approach overlaps the CPU scheduling overhead with GPU computation, improving overall system throughput.
