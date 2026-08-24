@@ -1,10 +1,10 @@
-from typing import Iterator
+from typing import Dict, Iterator
 
 import torch
 from minisgl.core import get_global_ctx
 from minisgl.distributed import DistributedCommunicator, get_tp_info
 from minisgl.moe import get_moe_backend_config
-from minisgl.moe.weights import quantize_expert_weight
+from minisgl.moe.weights import quantize_expert_weight, quantize_expert_weight_fp8
 from minisgl.utils import div_even
 
 from .base import BaseOP
@@ -41,8 +41,11 @@ class MoELayer(BaseOP):
         self._gate_up_scale: torch.Tensor | None = None
         self._down_scale: torch.Tensor | None = None
         self._weights_prepared = False
+        self._weights_quantized = False
         if self.ep_size > 1:
-            local_num_experts = div_even(num_experts, self.ep_size)
+            local_num_experts = div_even(num_experts, self.ep_size) + len(
+                moe_config.replicated_experts
+            )
             intermediate_size_per_partition = intermediate_size
         else:
             local_num_experts = num_experts
@@ -58,19 +61,65 @@ class MoELayer(BaseOP):
             intermediate_size_per_partition,
         )
 
+    def state_dict(
+        self,
+        *,
+        prefix: str = "",
+        result: Dict[str, torch.Tensor] | None = None,
+    ) -> Dict[str, torch.Tensor]:
+        result = result if result is not None else {}
+        key_prefix = f"{prefix}." if prefix else ""
+        result[f"{key_prefix}gate_up_proj"] = self.gate_up_proj
+        result[f"{key_prefix}down_proj"] = self.down_proj
+        if self._gate_up_scale is not None:
+            result[f"{key_prefix}gate_up_proj_scale"] = self._gate_up_scale
+        if self._down_scale is not None:
+            result[f"{key_prefix}down_proj_scale"] = self._down_scale
+        return result
+
+    def load_state_dict(
+        self,
+        state_dict: Dict[str, torch.Tensor],
+        *,
+        prefix: str = "",
+        _internal: bool = False,
+    ) -> None:
+        key_prefix = f"{prefix}." if prefix else ""
+        gate_up = state_dict.pop(f"{key_prefix}gate_up_proj")
+        down = state_dict.pop(f"{key_prefix}down_proj")
+        if gate_up.shape != self.gate_up_proj.shape or down.shape != self.down_proj.shape:
+            raise ValueError("checkpoint MoE expert shapes do not match the model config")
+        self.gate_up_proj = gate_up
+        self.down_proj = down
+        gate_scale = state_dict.pop(f"{key_prefix}gate_up_proj_scale", None)
+        down_scale = state_dict.pop(f"{key_prefix}down_proj_scale", None)
+        if (gate_scale is None) != (down_scale is None):
+            raise ValueError("checkpoint must provide scales for both MoE expert projections")
+        self._gate_up_scale = gate_scale
+        self._down_scale = down_scale
+        self._weights_quantized = gate_scale is not None
+        if not _internal and state_dict:
+            raise RuntimeError(f"Unexpected keys in state_dict: {list(state_dict.keys())}")
+
     def prepare_weights(self, device: torch.device) -> None:
         if self._weights_prepared:
             return
-        if self._moe_config.expert_quantization == "int8":
+        weights_quantized = getattr(self, "_weights_quantized", False)
+        if not weights_quantized and self._moe_config.expert_quantization == "int8":
             self.gate_up_proj, self._gate_up_scale = quantize_expert_weight(self.gate_up_proj)
             self.down_proj, self._down_scale = quantize_expert_weight(self.down_proj)
+            self._weights_quantized = True
+        elif not weights_quantized and self._moe_config.expert_quantization == "fp8":
+            self.gate_up_proj, self._gate_up_scale = quantize_expert_weight_fp8(self.gate_up_proj)
+            self.down_proj, self._down_scale = quantize_expert_weight_fp8(self.down_proj)
+            self._weights_quantized = True
         if self._moe_config.expert_offload:
-            self.gate_up_proj = self.gate_up_proj.cpu().pin_memory()
-            self.down_proj = self.down_proj.cpu().pin_memory()
+            self.gate_up_proj = self.gate_up_proj.cpu()
+            self.down_proj = self.down_proj.cpu()
             if self._gate_up_scale is not None:
-                self._gate_up_scale = self._gate_up_scale.cpu().pin_memory()
+                self._gate_up_scale = self._gate_up_scale.cpu()
             if self._down_scale is not None:
-                self._down_scale = self._down_scale.cpu().pin_memory()
+                self._down_scale = self._down_scale.cpu()
         else:
             self.gate_up_proj = self.gate_up_proj.to(device)
             self.down_proj = self.down_proj.to(device)

@@ -8,6 +8,7 @@ import safetensors
 import torch
 from minisgl.distributed import get_tp_info
 from minisgl.moe import get_moe_backend_config
+from minisgl.moe.weights import quantize_expert_weight, quantize_expert_weight_fp8
 from minisgl.utils import cached_load_hf_config, div_ceil, download_hf_weight
 from tqdm import tqdm
 
@@ -83,6 +84,52 @@ def _get_expert_stack_info(key: str) -> tuple[str, int] | None:
     return f"{match.group('prefix')}.{packed_name}", int(match.group("idx"))
 
 
+def _local_expert_index(
+    expert_idx: int,
+    *,
+    ep_size: int,
+    ep_rank: int,
+    local_experts: int,
+    placement: str,
+) -> int | None:
+    if ep_size == 1:
+        return expert_idx
+    if placement == "contiguous":
+        expert_start = ep_rank * local_experts
+        if expert_start <= expert_idx < expert_start + local_experts:
+            return expert_idx - expert_start
+        return None
+    if placement == "round-robin":
+        if expert_idx % ep_size == ep_rank:
+            return expert_idx // ep_size
+        return None
+    raise ValueError(f"Unsupported expert placement: {placement}")
+
+
+def _local_expert_indices(
+    expert_idx: int,
+    *,
+    ep_size: int,
+    ep_rank: int,
+    local_experts: int,
+    placement: str,
+    replicated_experts: Tuple[int, ...],
+) -> Tuple[int, ...]:
+    indices: list[int] = []
+    base_index = _local_expert_index(
+        expert_idx,
+        ep_size=ep_size,
+        ep_rank=ep_rank,
+        local_experts=local_experts,
+        placement=placement,
+    )
+    if base_index is not None:
+        indices.append(base_index)
+    if expert_idx in replicated_experts:
+        indices.append(local_experts + replicated_experts.index(expert_idx))
+    return tuple(indices)
+
+
 def load_weight(model_path: str, device: torch.device) -> Iterator[Tuple[str, torch.Tensor]]:
     """Streaming weight loader. Yields (name, tensor) pairs already sharded, merged,
     and on device. Peak CPU memory: one full tensor + a small merge buffer."""
@@ -96,9 +143,10 @@ def load_weight(model_path: str, device: torch.device) -> Iterator[Tuple[str, to
     moe_config = get_moe_backend_config()
     ep_size = moe_config.expert_parallel_size
     local_experts = config.num_experts // ep_size if ep_size > 1 else config.num_experts
-    expert_start = moe_config.expert_parallel_rank * local_experts
-    expert_end = expert_start + local_experts
-    stage_experts_on_cpu = moe_config.expert_offload or moe_config.expert_quantization == "int8"
+    packed_local_experts = local_experts + (
+        len(moe_config.replicated_experts) if ep_size > 1 else 0
+    )
+    stage_experts_on_cpu = moe_config.expert_offload or moe_config.expert_quantization != "none"
     checkpoint_device = torch.device("cpu") if stage_experts_on_cpu else device
 
     # Buffer for merge groups: merged_key -> {slot: tensor}
@@ -114,7 +162,14 @@ def load_weight(model_path: str, device: torch.device) -> Iterator[Tuple[str, to
                 expert_info = _get_expert_stack_info(name) if config.is_moe else None
                 if expert_info is not None and ep_size > 1:
                     _, expert_idx = expert_info
-                    if not expert_start <= expert_idx < expert_end:
+                    if not _local_expert_indices(
+                        expert_idx,
+                        ep_size=ep_size,
+                        ep_rank=moe_config.expert_parallel_rank,
+                        local_experts=local_experts,
+                        placement=moe_config.expert_placement,
+                        replicated_experts=moe_config.replicated_experts,
+                    ):
                         continue
                 raw = f.get_tensor(checkpoint_name)
                 tensor = _shard_tensor(
@@ -142,15 +197,32 @@ def load_weight(model_path: str, device: torch.device) -> Iterator[Tuple[str, to
 
                 if config.is_moe and (stack_info := _get_expert_stack_info(out[0])) is not None:
                     packed_key, expert_idx = stack_info
-                    if ep_size > 1:
-                        expert_idx -= expert_start
+                    local_expert_indices = _local_expert_indices(
+                        expert_idx,
+                        ep_size=ep_size,
+                        ep_rank=moe_config.expert_parallel_rank,
+                        local_experts=local_experts,
+                        placement=moe_config.expert_placement,
+                        replicated_experts=moe_config.replicated_experts,
+                    )
+                    assert local_expert_indices
                     slots = expert_buf.setdefault(packed_key, {})
-                    slots[expert_idx] = out[1]
-                    if len(slots) != local_experts:
+                    for local_expert_idx in local_expert_indices:
+                        slots[local_expert_idx] = out[1]
+                    if len(slots) != packed_local_experts:
                         continue
-                    experts = [slots[idx] for idx in range(local_experts)]
+                    experts = [slots[idx] for idx in range(packed_local_experts)]
                     del expert_buf[packed_key]
-                    yield packed_key, torch.stack(experts, dim=0)
+                    packed = torch.stack(experts, dim=0)
+                    if moe_config.expert_quantization == "int8":
+                        packed, scale = quantize_expert_weight(packed)
+                    elif moe_config.expert_quantization == "fp8":
+                        packed, scale = quantize_expert_weight_fp8(packed)
+                    else:
+                        scale = None
+                    yield packed_key, packed
+                    if scale is not None:
+                        yield f"{packed_key}_scale", scale
                 else:  # Normal dense model
                     yield out[0], out[1]
 

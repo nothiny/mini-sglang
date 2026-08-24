@@ -8,7 +8,11 @@ import torch.nn.functional as F
 from minisgl.layers.moe import MoELayer
 from minisgl.moe import MoeBackendConfig
 from minisgl.moe.fused import FusedMoe
-from minisgl.moe.weights import ExpertResidentCache, quantize_expert_weight
+from minisgl.moe.weights import (
+    ExpertResidentCache,
+    quantize_expert_weight,
+    quantize_expert_weight_fp8,
+)
 
 
 def torch_moe_reference(
@@ -102,6 +106,31 @@ def test_direct_and_grouped_moe_paths_match() -> None:
     torch.testing.assert_close(direct, grouped, atol=0.03, rtol=0.03)
 
 
+def test_grouped_moe_ignores_static_dispatch_padding() -> None:
+    torch.manual_seed(12)
+    device = torch.device("cuda")
+    hidden = torch.randn(8, 64, device=device, dtype=torch.bfloat16)
+    w1 = torch.randn(2, 128, 64, device=device, dtype=torch.bfloat16) / 8
+    w2 = torch.randn(2, 64, 64, device=device, dtype=torch.bfloat16) / 8
+    topk_ids = torch.tensor([[0], [-1], [1], [-1], [0], [1], [-1], [-1]], device=device)
+    topk_weights = (topk_ids >= 0).float()
+
+    output = FusedMoe(MoeBackendConfig())._run_experts(
+        hidden,
+        w1,
+        w2,
+        topk_weights,
+        topk_ids.to(torch.int32),
+        "silu",
+        False,
+        None,
+        None,
+    )
+
+    assert bool(torch.all(output[topk_ids.flatten() < 0] == 0))
+    assert bool(torch.all(torch.isfinite(output)))
+
+
 @pytest.mark.parametrize("small_m_threshold", [0, 8])
 def test_int8_expert_weights(small_m_threshold: int) -> None:
     torch.manual_seed(13)
@@ -128,6 +157,34 @@ def test_int8_expert_weights(small_m_threshold: int) -> None:
         w2_scale,
     )
     torch.testing.assert_close(actual, expected, atol=0.04, rtol=0.04)
+
+
+@pytest.mark.parametrize("num_tokens", [1, 16])
+def test_native_fp8_expert_weights(num_tokens: int) -> None:
+    torch.manual_seed(14)
+    device = torch.device("cuda")
+    hidden = torch.randn(num_tokens, 64, device=device, dtype=torch.bfloat16)
+    w1 = torch.randn(8, 128, 64, device=device, dtype=torch.bfloat16) / 8
+    w2 = torch.randn(8, 64, 64, device=device, dtype=torch.bfloat16) / 8
+    logits = torch.randn(num_tokens, 8, device=device, dtype=torch.bfloat16)
+    expected = FusedMoe(MoeBackendConfig()).forward(
+        hidden.clone(), w1, w2, logits, 2, True, "silu", False
+    )
+    w1_fp8, w1_scale = quantize_expert_weight_fp8(w1)
+    w2_fp8, w2_scale = quantize_expert_weight_fp8(w2)
+    actual = FusedMoe(MoeBackendConfig(expert_quantization="fp8")).forward(
+        hidden.clone(),
+        w1_fp8,
+        w2_fp8,
+        logits,
+        2,
+        True,
+        "silu",
+        False,
+        w1_scale,
+        w2_scale,
+    )
+    torch.testing.assert_close(actual, expected, atol=0.12, rtol=0.12)
 
 
 def test_int8_experts_are_quantized_on_cpu_before_gpu_transfer() -> None:
@@ -202,11 +259,18 @@ def test_fused_moe_autotunes_prefill_grouped_config() -> None:
 
 
 @pytest.mark.parametrize(
-    ("quantized", "cache_size"),
-    [(False, 4), (True, 4), (False, 2), (True, 2)],
+    ("quantization", "cache_size"),
+    [
+        ("none", 4),
+        ("int8", 4),
+        ("fp8", 4),
+        ("none", 2),
+        ("int8", 2),
+        ("fp8", 2),
+    ],
 )
 def test_fused_moe_expert_offload_matches_resident_weights(
-    quantized: bool,
+    quantization: str,
     cache_size: int,
 ) -> None:
     torch.manual_seed(19)
@@ -224,9 +288,12 @@ def test_fused_moe_expert_offload_matches_resident_weights(
     )
 
     w1_scale = w2_scale = None
-    if quantized:
+    if quantization == "int8":
         w1, w1_scale = quantize_expert_weight(w1)
         w2, w2_scale = quantize_expert_weight(w2)
+    elif quantization == "fp8":
+        w1, w1_scale = quantize_expert_weight_fp8(w1)
+        w2, w2_scale = quantize_expert_weight_fp8(w2)
     w1_host = w1.cpu().pin_memory()
     w2_host = w2.cpu().pin_memory()
     w1_scale_host = None if w1_scale is None else w1_scale.cpu().pin_memory()
@@ -234,7 +301,7 @@ def test_fused_moe_expert_offload_matches_resident_weights(
     backend = FusedMoe(
         MoeBackendConfig(
             small_m_threshold=0,
-            expert_quantization="int8" if quantized else "none",
+            expert_quantization=quantization,  # type: ignore[arg-type]
             expert_offload=True,
             expert_cache_size=cache_size,
         )
@@ -253,15 +320,16 @@ def test_fused_moe_expert_offload_matches_resident_weights(
             w1_scale_host,
             w2_scale_host,
         )
-        torch.testing.assert_close(actual, expected, atol=0.04, rtol=0.04)
+        tolerance = 0.12 if quantization == "fp8" else 0.04
+        torch.testing.assert_close(actual, expected, atol=tolerance, rtol=tolerance)
 
     cache = next(iter(backend._resident_caches.values()))
     if cache_size == 4:
         assert cache.misses == 4
         assert cache.hits == 4
     else:
-        assert cache.misses == 8
-        assert cache.hits == 0
+        assert cache.misses == 6
+        assert cache.hits == 2
 
 
 def test_expert_resident_cache_lru_and_remapping() -> None:
@@ -278,3 +346,18 @@ def test_expert_resident_cache_lru_and_remapping() -> None:
     torch.testing.assert_close(second.w1[0].cpu(), w1[2])
     assert cache.hits == 1
     assert cache.misses == 3
+
+
+def test_expert_resident_cache_uses_bounded_pinned_staging() -> None:
+    device = torch.device("cuda")
+    w1 = torch.randn(4, 8, 4, dtype=torch.bfloat16)
+    w2 = torch.randn(4, 4, 4, dtype=torch.bfloat16)
+    cache = ExpertResidentCache(w1, w2, None, None, capacity=2, device=device)
+
+    resolved = cache.resolve(torch.tensor([[0, 1]], dtype=torch.int32, device=device))
+    torch.cuda.synchronize()
+
+    assert cache._w1_staging is not None and cache._w1_staging.is_pinned()
+    assert cache._w1_staging.shape[0] == cache.capacity
+    torch.testing.assert_close(resolved.w1[0].cpu(), w1[0])
+    torch.testing.assert_close(resolved.w1[1].cpu(), w1[1])

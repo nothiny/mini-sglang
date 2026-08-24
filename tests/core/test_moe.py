@@ -50,6 +50,24 @@ def test_replicated_ep_dispatch_assigns_each_route_once() -> None:
     assert [sum(counts) for counts in all_send_counts] == [6, 6]
 
 
+def test_hot_expert_replica_keeps_routes_on_origin_rank() -> None:
+    hidden = torch.arange(4 * 3, dtype=torch.float32).view(4, 3)
+    topk_ids = torch.zeros((4, 2), dtype=torch.int32)
+    weights = torch.ones_like(topk_ids, dtype=torch.float32)
+    for rank in range(2):
+        _, local_ids, _, _, counts = build_replicated_dispatch_inputs(
+            hidden,
+            weights,
+            topk_ids,
+            rank=rank,
+            world_size=2,
+            num_experts=4,
+            replicated_experts=(0,),
+        )
+        assert counts.tolist() == ([4, 0] if rank == 0 else [0, 4])
+        assert local_ids.tolist() == [2, 2, 2, 2]
+
+
 def test_int8_quantization_is_per_output_channel() -> None:
     weight = torch.tensor(
         [[[1.0, -2.0], [100.0, -50.0]]],
@@ -74,11 +92,18 @@ def test_moe_cli_configuration() -> None:
             "--expert-parallel-size",
             "2",
             "--disable-moe-communication-overlap",
+            "--moe-expert-parallel-dispatch",
+            "static",
+            "--moe-expert-placement",
+            "round-robin",
+            "--moe-replicated-experts",
+            "0,3",
             "--moe-expert-quantization",
             "int8",
             "--moe-expert-offload",
             "--moe-expert-cache-size",
             "8",
+            "--disable-moe-expert-offload-overlap",
         ]
     )
 
@@ -87,9 +112,13 @@ def test_moe_cli_configuration() -> None:
     assert args.moe_small_m_threshold == 4
     assert args.expert_parallel_size == 2
     assert not args.moe_expert_parallel_overlap
+    assert args.moe_expert_parallel_dispatch == "static"
+    assert args.moe_expert_placement == "round-robin"
+    assert args.moe_replicated_experts == (0, 3)
     assert args.moe_expert_quantization == "int8"
     assert args.moe_expert_offload
     assert args.moe_expert_cache_size == 8
+    assert not args.moe_expert_offload_overlap
 
 
 def test_expert_cache_memory_reservation_includes_weights_scales_and_mapping() -> None:
@@ -110,3 +139,25 @@ def test_expert_cache_memory_reservation_includes_weights_scales_and_mapping() -
     )
     expected = 2 * bytes_per_expert + 4 * torch.int64.itemsize
     assert get_moe_expert_cache_bytes(_MoeRoot(layer), capacity=2) == expected
+
+
+def test_moe_layer_loads_prequantized_weights_and_scales() -> None:
+    layer = MoELayer.__new__(MoELayer)
+    layer.gate_up_proj = torch.empty(2, 8, 4, device="meta")
+    layer.down_proj = torch.empty(2, 4, 4, device="meta")
+    layer._gate_up_scale = None
+    layer._down_scale = None
+    layer._weights_quantized = False
+    state = {
+        "experts.gate_up_proj": torch.ones(2, 8, 4, dtype=torch.float8_e4m3fn),
+        "experts.down_proj": torch.ones(2, 4, 4, dtype=torch.float8_e4m3fn),
+        "experts.gate_up_proj_scale": torch.ones(2, 8),
+        "experts.down_proj_scale": torch.ones(2, 4),
+    }
+
+    layer.load_state_dict(state, prefix="experts")
+
+    assert layer.gate_up_proj.dtype == torch.float8_e4m3fn
+    assert layer.down_proj.dtype == torch.float8_e4m3fn
+    assert layer._weights_quantized
+    assert not state

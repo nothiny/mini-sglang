@@ -150,7 +150,14 @@ class Engine:
                 for k, v in self.model.state_dict().items()
             }
         else:
-            return {k: v.to(self.dtype) for k, v in load_weight(config.model_path, self.device)}
+            return {
+                key: (
+                    value
+                    if config.moe_expert_quantization != "none" and ".experts." in key
+                    else value.to(self.dtype)
+                )
+                for key, value in load_weight(config.model_path, self.device)
+            }
 
     def _determine_num_pages(self, old_free_memory: int, config: EngineConfig) -> int:
         new_free_memory = self._sync_get_memory()[1]
@@ -264,12 +271,25 @@ def _adjust_config(config: EngineConfig):
             logger.warning_rank0(
                 "Expert parallel All-to-All requires torch NCCL; disabling PyNCCL."
             )
-        if config.cuda_graph_bs != [] or config.cuda_graph_max_bs != 0:
+        if config.moe_expert_parallel_dispatch == "dynamic" and (
+            config.cuda_graph_bs != [] or config.cuda_graph_max_bs != 0
+        ):
             override("cuda_graph_bs", [])
             override("cuda_graph_max_bs", 0)
             logger.warning_rank0(
                 "CUDA graphs are disabled for variable-size expert-parallel dispatch."
             )
+        invalid_replicas = tuple(
+            expert_id
+            for expert_id in config.moe_replicated_experts
+            if expert_id >= config.model_config.num_experts
+        )
+        if invalid_replicas:
+            raise ValueError(
+                f"replicated expert IDs are outside the model range: {invalid_replicas}"
+            )
+    elif config.moe_replicated_experts:
+        raise ValueError("replicated experts require expert_parallel_size greater than one")
 
     if config.moe_expert_offload:
         if not config.model_config.is_moe:

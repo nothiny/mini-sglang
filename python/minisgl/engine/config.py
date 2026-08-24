@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import cached_property
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, List, Tuple
 
 import torch
 from minisgl.distributed import DistributedInfo
@@ -26,9 +26,14 @@ class EngineConfig:
     moe_autotune: bool = False
     expert_parallel_size: int = 1
     moe_expert_parallel_overlap: bool = True
+    moe_expert_parallel_dispatch: str = "dynamic"
+    moe_expert_placement: str = "contiguous"
+    moe_replicated_experts: Tuple[int, ...] = ()
     moe_expert_quantization: str = "none"
     moe_expert_offload: bool = False
     moe_expert_cache_size: int = 0
+    moe_expert_offload_overlap: bool = True
+    moe_expert_offload_wave_size: int = 8
     cuda_graph_bs: List[int] | None = None
     cuda_graph_max_bs: int | None = None
     page_size: int = 1
@@ -71,9 +76,14 @@ class EngineConfig:
             expert_parallel_size=self.expert_parallel_size,
             expert_parallel_rank=ep_rank,
             expert_parallel_overlap=self.moe_expert_parallel_overlap,
+            expert_parallel_dispatch=self.moe_expert_parallel_dispatch,  # type: ignore[arg-type]
+            expert_placement=self.moe_expert_placement,  # type: ignore[arg-type]
+            replicated_experts=self.moe_replicated_experts,
             expert_quantization=self.moe_expert_quantization,  # type: ignore[arg-type]
             expert_offload=self.moe_expert_offload,
             expert_cache_size=self.moe_expert_cache_size,
+            expert_offload_overlap=self.moe_expert_offload_overlap,
+            expert_offload_wave_size=self.moe_expert_offload_wave_size,
         )
 
     @property

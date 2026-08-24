@@ -29,6 +29,8 @@ class FusedMoeWorkspace:
     expert_ids: torch.Tensor
     num_tokens_post_pad: torch.Tensor
     cumsum_buffer: torch.Tensor
+    fp8_input: torch.Tensor
+    fp8_scale: torch.Tensor
 
     @classmethod
     def allocate(
@@ -69,6 +71,19 @@ class FusedMoeWorkspace:
             expert_ids=torch.empty(max_blocks, dtype=torch.int32, device=device),
             num_tokens_post_pad=torch.empty(1, dtype=torch.int32, device=device),
             cumsum_buffer=torch.empty(num_experts + 2, dtype=torch.int32, device=device),
+            fp8_input=torch.empty(
+                max(
+                    capacity_tokens * hidden_size,
+                    routed_capacity * (intermediate_size_x2 // 2),
+                ),
+                dtype=torch.float8_e4m3fn,
+                device=device,
+            ),
+            fp8_scale=torch.empty(
+                max(capacity_tokens, routed_capacity),
+                dtype=torch.float32,
+                device=device,
+            ),
         )
 
     def views(

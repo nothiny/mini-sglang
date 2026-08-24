@@ -3,6 +3,38 @@ import triton.language as tl
 
 
 @triton.jit
+def quantize_rows_fp8_kernel(
+    input_ptr,
+    output_ptr,
+    scale_ptr,
+    N,
+    stride_input_m,
+    stride_input_n,
+    stride_output_m,
+    stride_output_n,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Quantize each activation row to E4M3 with one FP32 scale."""
+
+    row = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK_SIZE)
+    values = tl.load(
+        input_ptr + row * stride_input_m + offsets * stride_input_n,
+        mask=offsets < N,
+        other=0.0,
+    ).to(tl.float32)
+    abs_max = tl.max(tl.abs(values), axis=0)
+    scale = tl.maximum(abs_max / 448.0, 1e-8)
+    quantized = tl.maximum(tl.minimum(values / scale, 448.0), -448.0)
+    tl.store(scale_ptr + row, scale)
+    tl.store(
+        output_ptr + row * stride_output_m + offsets * stride_output_n,
+        quantized,
+        mask=offsets < N,
+    )
+
+
+@triton.jit
 def direct_moe_gemv_kernel(
     a_ptr,
     b_ptr,
@@ -129,6 +161,7 @@ def fused_moe_kernel(
     c_ptr,
     topk_weights_ptr,
     b_scale_ptr,
+    a_scale_ptr,
     sorted_token_ids_ptr,
     expert_ids_ptr,
     num_tokens_post_padded_ptr,
@@ -158,6 +191,7 @@ def fused_moe_kernel(
     compute_type: tl.constexpr,
     even_Ks: tl.constexpr,
     HAS_SCALE: tl.constexpr,
+    NATIVE_FP8: tl.constexpr,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -249,7 +283,7 @@ def fused_moe_kernel(
             )
             b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
 
-        if HAS_SCALE:
+        if HAS_SCALE and not NATIVE_FP8:
             scale = tl.load(
                 b_scale_ptr + off_experts * N + offs_bn,
                 mask=offs_bn < N,
@@ -263,6 +297,19 @@ def fused_moe_kernel(
         # Advance the ptrs to the next K block.
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
+
+    if NATIVE_FP8:
+        input_scale = tl.load(
+            a_scale_ptr + offs_token // top_k,
+            mask=token_mask,
+            other=0.0,
+        )
+        weight_scale = tl.load(
+            b_scale_ptr + off_experts * N + offs_bn,
+            mask=offs_bn < N,
+            other=0.0,
+        )
+        accumulator *= input_scale[:, None] * weight_scale[None, :]
 
     if MUL_ROUTED_WEIGHT:
         moe_weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0)

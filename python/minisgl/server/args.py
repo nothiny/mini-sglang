@@ -314,8 +314,40 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     )
 
     parser.add_argument(
+        "--moe-expert-parallel-dispatch",
+        choices=("dynamic", "static"),
+        default=ServerArgs.moe_expert_parallel_dispatch,
+        help="Use compact dynamic EP messages or fixed device-side route buckets.",
+    )
+
+    parser.add_argument(
+        "--moe-expert-placement",
+        choices=("contiguous", "round-robin"),
+        default=ServerArgs.moe_expert_placement,
+        help="Map global experts to EP ranks contiguously or round-robin.",
+    )
+
+    def parse_replicated_experts(value: str) -> Tuple[int, ...]:
+        try:
+            expert_ids = tuple(int(item.strip()) for item in value.split(",") if item.strip())
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError("replicated expert IDs must be integers") from exc
+        if any(expert_id < 0 for expert_id in expert_ids):
+            raise argparse.ArgumentTypeError("replicated expert IDs must be non-negative")
+        if len(set(expert_ids)) != len(expert_ids):
+            raise argparse.ArgumentTypeError("replicated expert IDs must be unique")
+        return expert_ids
+
+    parser.add_argument(
+        "--moe-replicated-experts",
+        type=parse_replicated_experts,
+        default=ServerArgs.moe_replicated_experts,
+        help="Comma-separated hot expert IDs replicated on every EP rank.",
+    )
+
+    parser.add_argument(
         "--moe-expert-quantization",
-        choices=("none", "int8"),
+        choices=("none", "int8", "fp8"),
         default=ServerArgs.moe_expert_quantization,
         help="Weight-only quantization used for MoE experts.",
     )
@@ -331,6 +363,20 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         type=int,
         default=ServerArgs.moe_expert_cache_size,
         help="Number of experts retained per layer when CPU expert offload is enabled.",
+    )
+
+    parser.add_argument(
+        "--disable-moe-expert-offload-overlap",
+        action="store_false",
+        dest="moe_expert_offload_overlap",
+        help="Wait for an offload wave before computing instead of overlapping H2D and experts.",
+    )
+
+    parser.add_argument(
+        "--moe-expert-offload-wave-size",
+        type=int,
+        default=ServerArgs.moe_expert_offload_wave_size,
+        help="Number of newly loaded experts grouped per overlapped compute micro-wave.",
     )
 
     parser.add_argument(

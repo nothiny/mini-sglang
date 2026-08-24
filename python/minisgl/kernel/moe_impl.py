@@ -3,6 +3,36 @@ from typing import Any, Dict
 import torch
 
 
+def quantize_rows_fp8_triton(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    scale: torch.Tensor,
+) -> None:
+    import triton
+
+    from .triton.fused_moe import quantize_rows_fp8_kernel
+
+    input_2d = input.view(-1, input.shape[-1])
+    output_2d = output.view_as(input_2d)
+    if output_2d.dtype != torch.float8_e4m3fn:
+        raise ValueError("FP8 activation output must use torch.float8_e4m3fn")
+    if scale.shape != (input_2d.shape[0],):
+        raise ValueError("FP8 activation scale must contain one value per row")
+    block_size = triton.next_power_of_2(input_2d.shape[1])
+    quantize_rows_fp8_kernel[(input_2d.shape[0],)](
+        input_2d,
+        output_2d,
+        scale,
+        input_2d.shape[1],
+        input_2d.stride(0),
+        input_2d.stride(1),
+        output_2d.stride(0),
+        output_2d.stride(1),
+        BLOCK_SIZE=block_size,
+        num_warps=8,
+    )
+
+
 def direct_moe_gemv_triton(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -67,6 +97,7 @@ def fused_moe_kernel_triton(
     config: Dict[str, Any],
     compute_type: torch.dtype,
     B_scale: torch.Tensor | None = None,
+    A_scale: torch.Tensor | None = None,
 ) -> None:
     import triton
     import triton.language as tl
@@ -90,12 +121,21 @@ def fused_moe_kernel_triton(
         torch.float16: tl.float16,
         torch.float32: tl.float32,
     }[compute_type]
+    native_fp8 = A.dtype == torch.float8_e4m3fn or B.dtype == torch.float8_e4m3fn
+    if native_fp8 and not (
+        A.dtype == torch.float8_e4m3fn
+        and B.dtype == torch.float8_e4m3fn
+        and A_scale is not None
+        and B_scale is not None
+    ):
+        raise ValueError("Native FP8 MoE requires FP8 A/B tensors and both scale tensors")
     fused_moe_kernel[grid](
         A,
         B,
         C,
         topk_weights,
         B if B_scale is None else B_scale,
+        A if A_scale is None else A_scale,
         sorted_token_ids,
         expert_ids,
         num_tokens_post_padded,
@@ -115,6 +155,7 @@ def fused_moe_kernel_triton(
         compute_type=dtype,  # type: ignore
         even_Ks=even_Ks,  # type: ignore
         HAS_SCALE=B_scale is not None,
+        NATIVE_FP8=native_fp8,
         **config,
     )
 

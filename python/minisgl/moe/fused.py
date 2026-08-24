@@ -5,7 +5,7 @@ import torch
 from minisgl.moe import BaseMoeBackend
 from minisgl.moe.config import MoeBackendConfig
 from minisgl.moe.expert_parallel import ExpertParallelDispatcher
-from minisgl.moe.weights import ExpertResidentCache, ResidentExpertWeights
+from minisgl.moe.weights import ExpertLoadPlan, ExpertResidentCache, ResidentExpertWeights
 from minisgl.moe.workspace import FusedMoeWorkspace, FusedMoeWorkspaceCache
 from minisgl.utils import div_ceil
 
@@ -186,6 +186,24 @@ def get_moe_config_candidates(
             "BLOCK_SIZE_K": 32,
             "GROUP_SIZE_M": 8,
         },
+        {
+            "BLOCK_SIZE_M": 16,
+            "BLOCK_SIZE_N": 64,
+            "BLOCK_SIZE_K": 64,
+            "GROUP_SIZE_M": 1,
+        },
+        {
+            "BLOCK_SIZE_M": 32,
+            "BLOCK_SIZE_N": 32,
+            "BLOCK_SIZE_K": 64,
+            "GROUP_SIZE_M": 4,
+        },
+        {
+            "BLOCK_SIZE_M": 64,
+            "BLOCK_SIZE_N": 32,
+            "BLOCK_SIZE_K": 64,
+            "GROUP_SIZE_M": 8,
+        },
     )
     unique: list[Dict[str, int]] = []
     seen: set[Tuple[Tuple[str, int], ...]] = set()
@@ -227,6 +245,7 @@ def fused_experts_impl(
         direct_moe_gemv_triton,
         fused_moe_kernel_triton,
         moe_sum_reduce_triton,
+        quantize_rows_fp8_triton,
     )
     from minisgl.layers import gelu_and_mul, silu_and_mul
 
@@ -258,6 +277,14 @@ def fused_experts_impl(
         )
     _, _, intermediate_cache1, intermediate_cache2, intermediate_cache3 = workspace.views(M)
     compute_type = hidden_states.dtype
+    native_fp8 = w1.dtype == torch.float8_e4m3fn or w2.dtype == torch.float8_e4m3fn
+    if native_fp8 and not (
+        w1.dtype == torch.float8_e4m3fn
+        and w2.dtype == torch.float8_e4m3fn
+        and w1_scale is not None
+        and w2_scale is not None
+    ):
+        raise ValueError("FP8 MoE requires E4M3 w1/w2 tensors and both scale tensors")
 
     out_hidden_states = hidden_states
     curr_hidden_states = hidden_states
@@ -318,8 +345,15 @@ def fused_experts_impl(
         workspace=workspace,
     )
 
+    first_input = curr_hidden_states
+    first_input_scale = None
+    if native_fp8:
+        first_input = workspace.fp8_input[: curr_hidden_states.numel()].view_as(curr_hidden_states)
+        first_input_scale = workspace.fp8_scale[:tokens_num]
+        quantize_rows_fp8_triton(curr_hidden_states, first_input, first_input_scale)
+
     fused_moe_kernel_triton(
-        curr_hidden_states,
+        first_input,
         w1,
         intermediate_cache1,
         curr_topk_weights,
@@ -332,10 +366,19 @@ def fused_experts_impl(
         config,
         compute_type=compute_type,
         B_scale=w1_scale,
+        A_scale=first_input_scale,
     )
     FN_MAP[activation](intermediate_cache1.view(-1, N), intermediate_cache2)
+    second_input = intermediate_cache2
+    second_input_scale = None
+    if native_fp8:
+        second_input = workspace.fp8_input[: intermediate_cache2.numel()].view_as(
+            intermediate_cache2
+        )
+        second_input_scale = workspace.fp8_scale[: intermediate_cache2.shape[0]]
+        quantize_rows_fp8_triton(intermediate_cache2, second_input, second_input_scale)
     fused_moe_kernel_triton(
-        intermediate_cache2,
+        second_input,
         w2,
         (intermediate_cache3),
         curr_topk_weights,
@@ -348,6 +391,7 @@ def fused_experts_impl(
         config,
         compute_type=compute_type,
         B_scale=w2_scale,
+        A_scale=second_input_scale,
     )
 
     moe_sum_reduce_triton(
@@ -387,7 +431,9 @@ class FusedMoe(BaseMoeBackend):
             top_k,
             num_tokens,
         )
-        heuristic_direct = num_tokens <= self.config.small_m_threshold
+        heuristic_direct = num_tokens <= self.config.small_m_threshold or (
+            w1.dtype == torch.float8_e4m3fn and num_tokens == 1
+        )
         if (
             not self.config.autotune
             or self.config.expert_offload
@@ -493,17 +539,14 @@ class FusedMoe(BaseMoeBackend):
         self._grouped_config_choices[key] = grouped_config
         return use_direct, grouped_config
 
-    def _resolve_expert_weights(
+    def _get_resident_cache(
         self,
         w1: torch.Tensor,
         w2: torch.Tensor,
         w1_scale: torch.Tensor | None,
         w2_scale: torch.Tensor | None,
-        expert_ids: torch.Tensor,
         device: torch.device,
-    ) -> ResidentExpertWeights:
-        if not self.config.expert_offload:
-            return ResidentExpertWeights(w1, w2, w1_scale, w2_scale, expert_ids)
+    ) -> ExpertResidentCache:
         cache_key = id(w1)
         cache = self._resident_caches.get(cache_key)
         if cache is None:
@@ -516,62 +559,22 @@ class FusedMoe(BaseMoeBackend):
                 device=device,
             )
             self._resident_caches[cache_key] = cache
-        return cache.resolve(expert_ids)
+        return cache
 
-    def _record_expert_usage(
-        self,
-        source_w1: torch.Tensor,
-        resolved: ResidentExpertWeights,
-    ) -> None:
-        if not self.config.expert_offload:
-            return
-        self._resident_caches[id(source_w1)].record_usage(resolved.resident_slots)
-
-    def _run_experts(
+    def _run_resolved_experts(
         self,
         hidden_states: torch.Tensor,
-        w1: torch.Tensor,
-        w2: torch.Tensor,
+        resolved: ResidentExpertWeights,
         topk_weights: torch.Tensor,
-        topk_ids: torch.Tensor,
         activation: str,
         apply_router_weight_on_input: bool,
-        w1_scale: torch.Tensor | None,
-        w2_scale: torch.Tensor | None,
         workspace: FusedMoeWorkspace | None = None,
-        *,
-        allow_chunking: bool = True,
     ) -> torch.Tensor:
-        if self.config.expert_offload and allow_chunking:
-            capacity = min(self.config.expert_cache_size, w1.shape[0])
-            requested = torch.unique(topk_ids[topk_ids >= 0])
-            if requested.numel() > capacity:
-                return self._run_offloaded_experts_chunked(
-                    hidden_states,
-                    w1,
-                    w2,
-                    topk_weights,
-                    topk_ids,
-                    activation,
-                    apply_router_weight_on_input,
-                    w1_scale,
-                    w2_scale,
-                    requested,
-                    capacity,
-                )
-        resolved = self._resolve_expert_weights(
-            w1,
-            w2,
-            w1_scale,
-            w2_scale,
-            topk_ids,
-            hidden_states.device,
-        )
         if workspace is None or workspace.num_experts != resolved.w1.shape[0]:
             workspace = self.workspace_cache.get(
                 num_tokens=hidden_states.shape[0],
                 num_experts=resolved.w1.shape[0],
-                top_k=topk_ids.shape[1],
+                top_k=resolved.expert_ids.shape[1],
                 intermediate_size_x2=resolved.w1.shape[1],
                 hidden_size=resolved.w2.shape[1],
                 dtype=hidden_states.dtype,
@@ -604,10 +607,47 @@ class FusedMoe(BaseMoeBackend):
             w2_scale=resolved.w2_scale,
             grouped_config=grouped_config,
         )
-        self._record_expert_usage(w1, resolved)
         return output
 
-    def _run_offloaded_experts_chunked(
+    @staticmethod
+    def _select_route_ids(flat_ids: torch.Tensor, expert_ids: Tuple[int, ...]) -> torch.Tensor:
+        selected = torch.zeros_like(flat_ids, dtype=torch.bool)
+        for expert_id in expert_ids:
+            selected.logical_or_(flat_ids == expert_id)
+        return torch.nonzero(selected, as_tuple=False).flatten()
+
+    def _run_route_subset(
+        self,
+        source: torch.Tensor,
+        flat_weights: torch.Tensor,
+        flat_ids: torch.Tensor,
+        top_k: int,
+        route_ids: torch.Tensor,
+        plan: ExpertLoadPlan,
+        activation: str,
+        apply_router_weight_on_input: bool,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        token_ids = torch.div(route_ids, top_k, rounding_mode="floor")
+        remapped_ids = plan.resident.expert_ids.reshape(-1)[route_ids].view(-1, 1)
+        route_weights = flat_weights[route_ids].view(-1, 1)
+        route_hidden = source[token_ids].contiguous()
+        resolved = ResidentExpertWeights(
+            plan.resident.w1,
+            plan.resident.w2,
+            plan.resident.w1_scale,
+            plan.resident.w2_scale,
+            remapped_ids,
+        )
+        route_output = self._run_resolved_experts(
+            route_hidden,
+            resolved,
+            route_weights,
+            activation,
+            apply_router_weight_on_input,
+        )
+        return token_ids, route_output
+
+    def _run_offloaded_experts(
         self,
         hidden_states: torch.Tensor,
         w1: torch.Tensor,
@@ -618,42 +658,140 @@ class FusedMoe(BaseMoeBackend):
         apply_router_weight_on_input: bool,
         w1_scale: torch.Tensor | None,
         w2_scale: torch.Tensor | None,
-        requested: torch.Tensor,
-        capacity: int,
+        workspace: FusedMoeWorkspace | None,
     ) -> torch.Tensor:
-        """Process more active experts than fit in the resident cache.
+        """Pipeline resident compute with per-expert pinned-host transfers.
 
-        Routes are grouped into expert-sized waves. Each wave uses top-k=1
-        execution and is accumulated back into its original token row.
+        Route selection and remapping stay on the GPU. The host only observes
+        the compact unique expert set required to issue H2D copies. Warm-cache
+        calls retain the regular top-k fused path; cold calls run resident
+        routes immediately and consume each missing expert as its event fires.
         """
+
+        cache = self._get_resident_cache(w1, w2, w1_scale, w2_scale, hidden_states.device)
+        requested = cache.requested_experts(topk_ids)
+        if not requested:
+            return torch.zeros_like(hidden_states)
+        resident = tuple(expert_id for expert_id in requested if cache.is_resident(expert_id))
+        missing = tuple(expert_id for expert_id in requested if not cache.is_resident(expert_id))
+        capacity = cache.capacity
+        ordered = resident + missing
+        waves = tuple(
+            ordered[offset : offset + capacity] for offset in range(0, len(ordered), capacity)
+        )
 
         source = hidden_states
         output = torch.zeros_like(source)
         flat_ids = topk_ids.reshape(-1)
         flat_weights = topk_weights.reshape(-1)
         top_k = topk_ids.shape[1]
-        requested_ids = tuple(int(value) for value in requested.cpu().tolist())
-        for offset in range(0, len(requested_ids), capacity):
-            expert_wave = requested_ids[offset : offset + capacity]
-            selected = torch.zeros_like(flat_ids, dtype=torch.bool)
-            for expert_id in expert_wave:
-                selected.logical_or_(flat_ids == expert_id)
-            route_ids = torch.nonzero(selected, as_tuple=False).flatten()
-            token_ids = torch.div(route_ids, top_k, rounding_mode="floor")
-            wave_output = self._run_experts(
-                source[token_ids].contiguous(),
+        current_stream = torch.cuda.current_stream(hidden_states.device)
+        single_wave = len(waves) == 1
+
+        for wave in waves:
+            plan = cache.prepare(topk_ids, wave)
+
+            if not plan.transfers and single_wave:
+                result = self._run_resolved_experts(
+                    source,
+                    plan.resident,
+                    topk_weights,
+                    activation,
+                    apply_router_weight_on_input,
+                    workspace,
+                )
+                cache.record_usage(plan.resident.resident_slots)
+                return result
+
+            if not self.config.expert_offload_overlap:
+                if plan.transfers:
+                    # Copies share one stream, so the final event implies that
+                    # every preceding expert in this wave is ready.
+                    current_stream.wait_event(plan.transfers[-1].ready_event)
+                route_ids = self._select_route_ids(flat_ids, wave)
+                token_ids, wave_output = self._run_route_subset(
+                    source,
+                    flat_weights,
+                    flat_ids,
+                    top_k,
+                    route_ids,
+                    plan,
+                    activation,
+                    apply_router_weight_on_input,
+                )
+                output.index_add_(0, token_ids, wave_output)
+                cache.record_usage(plan.resident.resident_slots)
+                continue
+
+            if plan.hit_expert_ids:
+                hit_route_ids = self._select_route_ids(flat_ids, plan.hit_expert_ids)
+                token_ids, hit_output = self._run_route_subset(
+                    source,
+                    flat_weights,
+                    flat_ids,
+                    top_k,
+                    hit_route_ids,
+                    plan,
+                    activation,
+                    apply_router_weight_on_input,
+                )
+                output.index_add_(0, token_ids, hit_output)
+                cache.record_usage(plan.hit_slots)
+
+            wave_size = self.config.expert_offload_wave_size
+            for transfer_offset in range(0, len(plan.transfers), wave_size):
+                transfer_wave = plan.transfers[transfer_offset : transfer_offset + wave_size]
+                current_stream.wait_event(transfer_wave[-1].ready_event)
+                transfer_ids = tuple(transfer.expert_id for transfer in transfer_wave)
+                route_ids = self._select_route_ids(flat_ids, transfer_ids)
+                token_ids, expert_output = self._run_route_subset(
+                    source,
+                    flat_weights,
+                    flat_ids,
+                    top_k,
+                    route_ids,
+                    plan,
+                    activation,
+                    apply_router_weight_on_input,
+                )
+                output.index_add_(0, token_ids, expert_output)
+                cache.record_usage(tuple(transfer.resident_slot for transfer in transfer_wave))
+        return output
+
+    def _run_experts(
+        self,
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        activation: str,
+        apply_router_weight_on_input: bool,
+        w1_scale: torch.Tensor | None,
+        w2_scale: torch.Tensor | None,
+        workspace: FusedMoeWorkspace | None = None,
+    ) -> torch.Tensor:
+        if self.config.expert_offload:
+            return self._run_offloaded_experts(
+                hidden_states,
                 w1,
                 w2,
-                flat_weights[route_ids].view(-1, 1),
-                flat_ids[route_ids].view(-1, 1),
+                topk_weights,
+                topk_ids,
                 activation,
                 apply_router_weight_on_input,
                 w1_scale,
                 w2_scale,
-                allow_chunking=False,
+                workspace,
             )
-            output.index_add_(0, token_ids, wave_output)
-        return output
+        return self._run_resolved_experts(
+            hidden_states,
+            ResidentExpertWeights(w1, w2, w1_scale, w2_scale, topk_ids),
+            topk_weights,
+            activation,
+            apply_router_weight_on_input,
+            workspace,
+        )
 
     def _run_expert_parallel(
         self,
@@ -668,10 +806,14 @@ class FusedMoe(BaseMoeBackend):
         w2_scale: torch.Tensor | None,
     ) -> torch.Tensor:
         if self._ep_dispatcher is None:
+            local_sharded_experts = w1.shape[0] - len(self.config.replicated_experts)
             self._ep_dispatcher = ExpertParallelDispatcher(
-                num_experts=self.config.expert_parallel_size * w1.shape[0],
+                num_experts=self.config.expert_parallel_size * local_sharded_experts,
                 rank=self.config.expert_parallel_rank,
                 world_size=self.config.expert_parallel_size,
+                dispatch_mode=self.config.expert_parallel_dispatch,
+                placement=self.config.expert_placement,
+                replicated_experts=self.config.replicated_experts,
             )
         dispatch = self._ep_dispatcher.dispatch(hidden_states, topk_weights, topk_ids)
         local_outputs: torch.Tensor | None = None
@@ -763,7 +905,10 @@ class FusedMoe(BaseMoeBackend):
         w2_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         num_tokens = hidden_states.shape[0]
-        expected_experts = w1.shape[0] * self.config.expert_parallel_size
+        local_sharded_experts = w1.shape[0]
+        if self.config.expert_parallel_size > 1:
+            local_sharded_experts -= len(self.config.replicated_experts)
+        expected_experts = local_sharded_experts * self.config.expert_parallel_size
         if gating_output.shape[1] != expected_experts:
             raise ValueError(
                 f"router has {gating_output.shape[1]} experts, but weights/config expect "

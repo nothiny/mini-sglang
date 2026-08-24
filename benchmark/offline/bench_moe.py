@@ -10,7 +10,7 @@ from typing import Dict, Iterable, List
 import torch
 from minisgl.moe import MoeBackendConfig
 from minisgl.moe.fused import FusedMoe
-from minisgl.moe.weights import quantize_expert_weight
+from minisgl.moe.weights import quantize_expert_weight, quantize_expert_weight_fp8
 
 
 def parse_args() -> argparse.Namespace:
@@ -32,8 +32,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dtype", choices=("float16", "bfloat16"), default="bfloat16")
     parser.add_argument("--include-autotune", action="store_true")
     parser.add_argument("--include-int8", action="store_true")
+    parser.add_argument("--include-fp8", action="store_true")
     parser.add_argument("--include-offload", action="store_true")
     parser.add_argument("--offload-cache-size", type=int, default=16)
+    parser.add_argument(
+        "--offload-wave-size",
+        type=int,
+        default=MoeBackendConfig.expert_offload_wave_size,
+    )
     args = parser.parse_args()
     args.token_counts = tuple(int(value) for value in args.token_counts.split(","))
     if any(value < 1 for value in args.token_counts):
@@ -42,6 +48,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--offload-cache-size must be positive")
     if args.inner_repeats < 1:
         parser.error("--inner-repeats must be positive")
+    if args.offload_wave_size < 1:
+        parser.error("--offload-wave-size must be positive")
     return args
 
 
@@ -78,6 +86,9 @@ def make_backend(
     autotune: bool = False,
     expert_offload: bool = False,
     expert_cache_size: int = 0,
+    expert_offload_overlap: bool = True,
+    expert_offload_wave_size: int = MoeBackendConfig.expert_offload_wave_size,
+    expert_quantization: str = "none",
 ) -> FusedMoe:
     return FusedMoe(
         MoeBackendConfig(
@@ -86,6 +97,9 @@ def make_backend(
             autotune=autotune,
             expert_offload=expert_offload,
             expert_cache_size=expert_cache_size,
+            expert_offload_overlap=expert_offload_overlap,
+            expert_offload_wave_size=expert_offload_wave_size,
+            expert_quantization=expert_quantization,  # type: ignore[arg-type]
         )
     )
 
@@ -126,6 +140,10 @@ def run_case(
             device="cuda",
             generator=generator,
         )
+        route_ids = torch.topk(router_logits.float(), top_k, dim=-1).indices
+        route_counts = torch.bincount(route_ids.flatten(), minlength=num_experts)
+        active_experts = int(torch.count_nonzero(route_counts))
+        peak_routes = int(route_counts.max())
 
         def call() -> None:
             input_buffer.copy_(source)
@@ -147,6 +165,8 @@ def run_case(
             {
                 "case": name,
                 "num_tokens": num_tokens,
+                "active_experts": active_experts,
+                "peak_routes_per_expert": peak_routes,
                 **timing,
                 "workspace_allocations": backend.workspace_cache.allocation_count,
                 "expert_cache_hits": sum(cache.hits for cache in backend._resident_caches.values()),
@@ -243,15 +263,40 @@ def main() -> None:
             inner_repeats=args.inner_repeats,
         )
     if args.include_offload:
-        w1_host = w1.cpu().pin_memory()
-        w2_host = w2.cpu().pin_memory()
+        w1_host = w1.cpu()
+        w2_host = w2.cpu()
         results += run_case(
-            name=f"offload-cache-{args.offload_cache_size}",
+            name=f"offload-cache-{args.offload_cache_size}-overlap",
             backend=make_backend(
                 workspace_cache=True,
                 small_m_threshold=args.small_m_threshold,
                 expert_offload=True,
                 expert_cache_size=args.offload_cache_size,
+                expert_offload_overlap=True,
+                expert_offload_wave_size=args.offload_wave_size,
+            ),
+            token_counts=args.token_counts,
+            hidden_size=args.hidden_size,
+            num_experts=args.num_experts,
+            top_k=args.top_k,
+            w1=w1_host,
+            w2=w2_host,
+            w1_scale=None,
+            w2_scale=None,
+            dtype=dtype,
+            warmup=args.warmup,
+            iterations=args.iterations,
+            inner_repeats=args.inner_repeats,
+        )
+        results += run_case(
+            name=f"offload-cache-{args.offload_cache_size}-serial",
+            backend=make_backend(
+                workspace_cache=True,
+                small_m_threshold=args.small_m_threshold,
+                expert_offload=True,
+                expert_cache_size=args.offload_cache_size,
+                expert_offload_overlap=False,
+                expert_offload_wave_size=args.offload_wave_size,
             ),
             token_counts=args.token_counts,
             hidden_size=args.hidden_size,
@@ -285,6 +330,29 @@ def main() -> None:
         iterations=args.iterations,
         inner_repeats=args.inner_repeats,
     )
+    if args.include_fp8:
+        w1_fp8, w1_fp8_scale = quantize_expert_weight_fp8(w1)
+        w2_fp8, w2_fp8_scale = quantize_expert_weight_fp8(w2)
+        results += run_case(
+            name="optimized-fp8-hybrid",
+            backend=make_backend(
+                workspace_cache=True,
+                small_m_threshold=0,
+                expert_quantization="fp8",
+            ),
+            token_counts=args.token_counts,
+            hidden_size=args.hidden_size,
+            num_experts=args.num_experts,
+            top_k=args.top_k,
+            w1=w1_fp8,
+            w2=w2_fp8,
+            w1_scale=w1_fp8_scale,
+            w2_scale=w2_fp8_scale,
+            dtype=dtype,
+            warmup=args.warmup,
+            iterations=args.iterations,
+            inner_repeats=args.inner_repeats,
+        )
     if args.include_int8:
         w1_int8, w1_scale = quantize_expert_weight(w1)
         w2_int8, w2_scale = quantize_expert_weight(w2)
