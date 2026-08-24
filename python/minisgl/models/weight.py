@@ -7,6 +7,7 @@ from typing import Dict, Iterator, Tuple
 import safetensors
 import torch
 from minisgl.distributed import get_tp_info
+from minisgl.moe import get_moe_backend_config
 from minisgl.utils import cached_load_hf_config, div_ceil, download_hf_weight
 from tqdm import tqdm
 
@@ -31,8 +32,18 @@ _SLOT_NAMES = {
 _EXPERT_PATTERN = re.compile(r"^(?P<prefix>.+\.experts)\.(?P<idx>\d+)\.(?P<name>.+)$")
 
 
-def _shard_tensor(key: str, value: torch.Tensor, r: int, n: int, num_kv_heads: int):
+def _shard_tensor(
+    key: str,
+    value: torch.Tensor,
+    r: int,
+    n: int,
+    num_kv_heads: int,
+    *,
+    expert_parallel: bool = False,
+):
     """Extract rank r's shard from a single tensor. Returns a contiguous copy."""
+    if expert_parallel and _EXPERT_PATTERN.match(key):
+        return value
     if any(key.count(sub) for sub in _SPLIT_DIM_0):
         is_kv_proj = any(key.count(sub) for sub in (".k_proj", ".v_proj"))
         if is_kv_proj and num_kv_heads is not None and num_kv_heads < n:
@@ -82,20 +93,41 @@ def load_weight(model_path: str, device: torch.device) -> Iterator[Tuple[str, to
     files = glob.glob(f"{model_folder}/*.safetensors")
     files = [f for f in files if not f.endswith("consolidated.safetensors")] or files
     tp_info = get_tp_info()
+    moe_config = get_moe_backend_config()
+    ep_size = moe_config.expert_parallel_size
+    local_experts = config.num_experts // ep_size if ep_size > 1 else config.num_experts
+    expert_start = moe_config.expert_parallel_rank * local_experts
+    expert_end = expert_start + local_experts
+    stage_experts_on_cpu = moe_config.expert_offload or moe_config.expert_quantization == "int8"
+    checkpoint_device = torch.device("cpu") if stage_experts_on_cpu else device
 
     # Buffer for merge groups: merged_key -> {slot: tensor}
     merge_buf: Dict[str, Dict[str, torch.Tensor]] = {}
     expert_buf: Dict[str, Dict[int, torch.Tensor]] = {}
     for file in tqdm(files, desc="Loading weights", disable=not tp_info.is_primary()):
-        with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
-            for name in f.keys():
+        with safetensors.safe_open(file, framework="pt", device=str(checkpoint_device)) as f:
+            for checkpoint_name in f.keys():
                 # Strip multimodal wrapper prefix, skip vision/projector weights
-                if name.startswith(("vision_tower.", "multi_modal_projector.")):
+                if checkpoint_name.startswith(("vision_tower.", "multi_modal_projector.")):
                     continue
-                raw = f.get_tensor(name)
-                name = name.removeprefix("language_model.")
-                tensor = _shard_tensor(name, raw, tp_info.rank, tp_info.size, config.num_kv_heads)
+                name = checkpoint_name.removeprefix("language_model.")
+                expert_info = _get_expert_stack_info(name) if config.is_moe else None
+                if expert_info is not None and ep_size > 1:
+                    _, expert_idx = expert_info
+                    if not expert_start <= expert_idx < expert_end:
+                        continue
+                raw = f.get_tensor(checkpoint_name)
+                tensor = _shard_tensor(
+                    name,
+                    raw,
+                    tp_info.rank,
+                    tp_info.size,
+                    config.num_kv_heads,
+                    expert_parallel=ep_size > 1,
+                )
                 del raw
+                if not (stage_experts_on_cpu and expert_info is not None):
+                    tensor = tensor.to(device)
 
                 if (info := _get_merge_info(name)) is None:
                     out = (name, tensor)
@@ -108,13 +140,15 @@ def load_weight(model_path: str, device: torch.device) -> Iterator[Tuple[str, to
                     del merge_buf[merged_key]
                     out = (merged_key, torch.cat(parts, dim=0))
 
-                if config.is_moe and (expert_info := _get_expert_stack_info(out[0])) is not None:
-                    packed_key, expert_idx = expert_info
+                if config.is_moe and (stack_info := _get_expert_stack_info(out[0])) is not None:
+                    packed_key, expert_idx = stack_info
+                    if ep_size > 1:
+                        expert_idx -= expert_start
                     slots = expert_buf.setdefault(packed_key, {})
                     slots[expert_idx] = out[1]
-                    if len(slots) != config.num_experts:
+                    if len(slots) != local_experts:
                         continue
-                    experts = [slots[idx] for idx in range(config.num_experts)]
+                    experts = [slots[idx] for idx in range(local_experts)]
                     del expert_buf[packed_key]
                     yield packed_key, torch.stack(experts, dim=0)
                 else:  # Normal dense model

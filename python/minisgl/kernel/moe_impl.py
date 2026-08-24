@@ -3,6 +3,56 @@ from typing import Any, Dict
 import torch
 
 
+def direct_moe_gemv_triton(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    B_scale: torch.Tensor | None = None,
+    *,
+    input_is_routed: bool,
+    mul_routed_weight: bool,
+    config: Dict[str, Any],
+) -> None:
+    import triton
+
+    from .triton.fused_moe import direct_moe_gemv_kernel
+
+    num_routes = topk_ids.numel()
+    top_k = topk_ids.shape[1]
+    output_size = B.shape[1]
+    reduction_size = B.shape[2]
+    output_2d = C.view(num_routes, output_size)
+    input_2d = A.view(-1, reduction_size)
+    grid = (num_routes, triton.cdiv(output_size, config["BLOCK_SIZE_N"]))
+    direct_moe_gemv_kernel[grid](
+        input_2d,
+        B,
+        output_2d,
+        topk_weights,
+        topk_ids,
+        B if B_scale is None else B_scale,
+        num_routes,
+        B.shape[0],
+        output_size,
+        reduction_size,
+        input_2d.stride(0),
+        input_2d.stride(1),
+        B.stride(0),
+        B.stride(1),
+        B.stride(2),
+        output_2d.stride(0),
+        output_2d.stride(1),
+        TOP_K=top_k,
+        INPUT_IS_ROUTED=input_is_routed,
+        MUL_ROUTED_WEIGHT=mul_routed_weight,
+        HAS_SCALE=B_scale is not None,
+        BLOCK_SIZE_N=config["BLOCK_SIZE_N"],
+        BLOCK_SIZE_K=config["BLOCK_SIZE_K"],
+    )
+
+
 def fused_moe_kernel_triton(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -16,6 +66,7 @@ def fused_moe_kernel_triton(
     top_k: int,
     config: Dict[str, Any],
     compute_type: torch.dtype,
+    B_scale: torch.Tensor | None = None,
 ) -> None:
     import triton
     import triton.language as tl
@@ -34,12 +85,17 @@ def fused_moe_kernel_triton(
         even_Ks = True
     else:
         even_Ks = False
-    dtype = tl.bfloat16 if compute_type == torch.bfloat16 else tl.float16
+    dtype = {
+        torch.bfloat16: tl.bfloat16,
+        torch.float16: tl.float16,
+        torch.float32: tl.float32,
+    }[compute_type]
     fused_moe_kernel[grid](
         A,
         B,
         C,
         topk_weights,
+        B if B_scale is None else B_scale,
         sorted_token_ids,
         expert_ids,
         num_tokens_post_padded,
@@ -58,6 +114,7 @@ def fused_moe_kernel_triton(
         top_k=top_k,  # type: ignore
         compute_type=dtype,  # type: ignore
         even_Ks=even_Ks,  # type: ignore
+        HAS_SCALE=B_scale is not None,
         **config,
     )
 

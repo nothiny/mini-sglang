@@ -8,9 +8,9 @@ from minisgl.attention import create_attention_backend
 from minisgl.core import Batch, Context, Req, set_global_ctx
 from minisgl.distributed import destroy_distributed, enable_pynccl_distributed, set_tp_info
 from minisgl.kvcache import create_kvcache_pool
-from minisgl.layers import set_rope_device
+from minisgl.layers import get_moe_expert_cache_bytes, prepare_moe_weights, set_rope_device
 from minisgl.models import create_model, load_weight
-from minisgl.moe import create_moe_backend
+from minisgl.moe import create_moe_backend, set_moe_backend_config
 from minisgl.utils import div_even, init_logger, is_sm90_supported, is_sm100_supported, torch_dtype
 
 from .config import EngineConfig
@@ -31,6 +31,7 @@ class Engine:
         assert not torch.cuda.is_initialized()
         set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
         _adjust_config(config)
+        set_moe_backend_config(config.moe_backend_config)
 
         self.device = torch.device(f"cuda:{config.tp_info.rank}")
         torch.cuda.set_device(self.device)
@@ -50,6 +51,8 @@ class Engine:
         with torch.device("meta"), torch_dtype(config.dtype):
             self.model = create_model(config.model_config)
         self.model.load_state_dict(self._load_weight_state_dict(config))
+        if config.model_config.is_moe:
+            prepare_moe_weights(self.model, self.device)
 
         # ======================= KV cache initialization ========================
         self.kv_bytes_per_token = _get_kv_bytes_per_token(config)
@@ -78,7 +81,10 @@ class Engine:
             config.attention_backend, config.model_config
         )
         if config.model_config.is_moe:
-            self.ctx.moe_backend = self.moe_backend = create_moe_backend(config.moe_backend)
+            self.ctx.moe_backend = self.moe_backend = create_moe_backend(
+                config.moe_backend,
+                config.moe_backend_config,
+            )
 
         # ======================= Sampler initialization ========================
         self.sampler = Sampler(self.device, config.model_config.vocab_size)
@@ -152,7 +158,18 @@ class Engine:
         num_pages = config.num_page_override
         if num_pages is None:
             model_memory = old_free_memory - new_free_memory
-            available_memory = int(config.memory_ratio * old_free_memory) - model_memory
+            expert_cache_memory = 0
+            if config.moe_expert_offload:
+                expert_cache_memory = get_moe_expert_cache_bytes(
+                    self.model,
+                    config.moe_expert_cache_size,
+                )
+                logger.info_rank0(
+                    f"Reserving {mem_GB(expert_cache_memory)} for the GPU expert cache"
+                )
+            available_memory = (
+                int(config.memory_ratio * old_free_memory) - model_memory - expert_cache_memory
+            )
             num_pages = available_memory // cache_per_page
 
         assert num_pages > 1, "Not enough memory for KV cache, try reducing --num-pages"
@@ -235,3 +252,32 @@ def _adjust_config(config: EngineConfig):
     if config.model_config.is_moe and config.moe_backend == "auto":
         override("moe_backend", "fused")
         logger.info_rank0(f"Auto-selected MoE backend: {config.moe_backend}")
+
+    if config.expert_parallel_size not in (1, config.tp_info.size):
+        raise ValueError("expert_parallel_size currently must be 1 or equal tensor parallel size")
+    if config.expert_parallel_size > 1:
+        if not config.model_config.is_moe:
+            raise ValueError("expert parallelism requires an MoE model")
+        div_even(config.model_config.num_experts, config.expert_parallel_size)
+        if config.use_pynccl:
+            override("use_pynccl", False)
+            logger.warning_rank0(
+                "Expert parallel All-to-All requires torch NCCL; disabling PyNCCL."
+            )
+        if config.cuda_graph_bs != [] or config.cuda_graph_max_bs != 0:
+            override("cuda_graph_bs", [])
+            override("cuda_graph_max_bs", 0)
+            logger.warning_rank0(
+                "CUDA graphs are disabled for variable-size expert-parallel dispatch."
+            )
+
+    if config.moe_expert_offload:
+        if not config.model_config.is_moe:
+            raise ValueError("expert offload requires an MoE model")
+        if config.cuda_graph_bs != [] or config.cuda_graph_max_bs != 0:
+            override("cuda_graph_bs", [])
+            override("cuda_graph_max_bs", 0)
+            logger.warning_rank0("CUDA graphs are disabled for dynamic expert cache residency.")
+
+    if config.moe_expert_quantization != "none" and not config.model_config.is_moe:
+        raise ValueError("expert quantization requires an MoE model")

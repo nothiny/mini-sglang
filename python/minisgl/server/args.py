@@ -280,6 +280,60 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     )
 
     parser.add_argument(
+        "--disable-moe-workspace-cache",
+        action="store_false",
+        dest="moe_enable_workspace_cache",
+        help="Allocate temporary MoE tensors on every forward instead of reusing workspaces.",
+    )
+
+    parser.add_argument(
+        "--moe-small-m-threshold",
+        type=int,
+        default=ServerArgs.moe_small_m_threshold,
+        help="Use the decode-oriented direct expert kernel up to this token count.",
+    )
+
+    parser.add_argument(
+        "--moe-autotune",
+        action="store_true",
+        help="Profile MoE kernel paths and grouped configs once per shape and token bucket.",
+    )
+
+    parser.add_argument(
+        "--expert-parallel-size",
+        type=int,
+        default=ServerArgs.expert_parallel_size,
+        help="Shard experts across this many ranks; currently 1 or TP size.",
+    )
+
+    parser.add_argument(
+        "--disable-moe-communication-overlap",
+        action="store_false",
+        dest="moe_expert_parallel_overlap",
+        help="Wait for expert All-to-All before computing rank-local routes.",
+    )
+
+    parser.add_argument(
+        "--moe-expert-quantization",
+        choices=("none", "int8"),
+        default=ServerArgs.moe_expert_quantization,
+        help="Weight-only quantization used for MoE experts.",
+    )
+
+    parser.add_argument(
+        "--moe-expert-offload",
+        action="store_true",
+        help="Keep expert weights on CPU and load routed experts into a GPU LRU cache.",
+    )
+
+    parser.add_argument(
+        "--moe-expert-cache-size",
+        type=int,
+        default=ServerArgs.moe_expert_cache_size,
+        help="Number of experts retained per layer when CPU expert offload is enabled.",
+    )
+
+    parser.add_argument(
         "--shell-mode",
         action="store_true",
         help="Run the server in shell mode.",
@@ -327,6 +381,7 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     result = ServerArgs(**kwargs)
     try:
         result.eviction_policy_config
+        result.moe_backend_config
     except ValueError as error:
         parser.error(str(error))
     logger = init_logger(__name__)

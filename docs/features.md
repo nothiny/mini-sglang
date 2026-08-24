@@ -18,9 +18,14 @@ python -m minisgl --model "Qwen/Qwen3-0.6B" --shell
 
 To scale performance across multiple GPUs, Mini-SGLang supports Tensor Parallelism (TP). You can enable distributed serving by specifying the number of GPUs with the `--tp n` argument, where `n` is the degree of parallelism.
 
+For Qwen3 MoE models, experts can instead be sharded across the TP ranks with
+`--expert-parallel-size n`. The MoE backend also supports reusable workspaces, a decode-oriented
+small-M kernel, per-shape autotuning, INT8 expert weights, and CPU/GPU expert residency. See
+[MoE Optimizations](./moe_optimizations.md) for configuration and current constraints.
+
 ## Supported Models
 
-Our framework currently supports the following dense model architectures:
+Our framework currently supports the following model architectures:
 
 - [`Llama-3`](https://huggingface.co/collections/meta-llama/llama-31) series
 - [`Qwen-3`](https://huggingface.co/collections/Qwen/qwen3) series (including MoE)

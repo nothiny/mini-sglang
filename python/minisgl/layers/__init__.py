@@ -9,7 +9,7 @@ from .linear import (
     LinearReplicated,
     LinearRowParallel,
 )
-from .moe import MoELayer
+from .moe import MoELayer, get_moe_expert_cache_bytes, prepare_moe_weights
 from .norm import RMSNorm, RMSNormFused
 from .rotary import get_rope, set_rope_device
 
@@ -32,4 +32,6 @@ __all__ = [
     "set_rope_device",
     "LinearReplicated",
     "MoELayer",
+    "get_moe_expert_cache_bytes",
+    "prepare_moe_weights",
 ]
