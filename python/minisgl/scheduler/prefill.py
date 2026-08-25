@@ -5,12 +5,13 @@ from typing import TYPE_CHECKING, List, Tuple
 
 import torch
 from minisgl.core import Batch, Req
+from minisgl.kvcache import BaseCacheHandle
 from minisgl.utils import init_logger
 
 from .utils import PendingReq
 
 if TYPE_CHECKING:
-    from minisgl.kvcache import BaseCacheHandle
+    from minisgl.kvcache import MatchResult
     from minisgl.message import UserMsg
 
     from .cache import CacheManager
@@ -35,30 +36,62 @@ class PrefillAdder:
     reserved_size: int
     cache_manager: CacheManager
     table_manager: TableManager
+    allow_async_restore: bool = False
 
     def _try_allocate_one(self, req: PendingReq) -> Tuple[BaseCacheHandle, int] | None:
+        if req.materialization is not None:
+            pending = req.materialization
+            handle = self.cache_manager.progress_materialization(
+                pending, blocking=not self.allow_async_restore
+            )
+            if handle is None:
+                return None
+            req.materialization = None
+            table_idx = pending.table_idx
+            cached_len = handle.cached_len
+            if cached_len > 0:
+                device_ids = self.table_manager.token_pool[table_idx][:cached_len]
+                device_ids.copy_(req.input_ids[:cached_len].pin_memory(), non_blocking=True)
+            return handle, table_idx
+
         if self.table_manager.available_size == 0:
             return None
 
-        # TODO: consider host cache match case
-        handle = self.cache_manager.match_req(req).cuda_handle
-        cached_len = handle.cached_len
-        # TODO: better estimate policy
-        extend_len = req.input_len - cached_len
-        estimated_len = extend_len + req.output_len
+        def get_match_and_estimate() -> Tuple[MatchResult, BaseCacheHandle, int]:
+            match = self.cache_manager.match_req(req)
+            handle = match.cuda_handle
+            extend_len = req.input_len - handle.cached_len
+            return match, handle, extend_len + req.output_len
+
+        match, handle, estimated_len = get_match_and_estimate()
 
         if estimated_len + self.reserved_size > self.cache_manager.available_size:
-            return None
+            if not self.cache_manager.has_pending_transfers:
+                return None
+            self.cache_manager.poll_transfers(blocking=True)
+            match, handle, estimated_len = get_match_and_estimate()
+            if estimated_len + self.reserved_size > self.cache_manager.available_size:
+                return None
         self.cache_manager.lock(handle)
         if estimated_len + self.reserved_size > self.cache_manager.available_size:
-            return self.cache_manager.unlock(handle)
+            self.cache_manager.unlock(handle)
+            return None
 
         table_idx = self.table_manager.allocate()
+        materialized = self.cache_manager.begin_materialize_match(
+            req,
+            match,
+            table_idx,
+            allow_async=self.allow_async_restore,
+        )
+        if not isinstance(materialized, BaseCacheHandle):
+            req.materialization = materialized
+            return None
+        handle = materialized
+        cached_len = handle.cached_len
         if cached_len > 0:  # NOTE: set the cached part
             device_ids = self.table_manager.token_pool[table_idx][:cached_len]
-            page_entry = self.table_manager.page_table[table_idx][:cached_len]
             device_ids.copy_(req.input_ids[:cached_len].pin_memory(), non_blocking=True)
-            page_entry.copy_(handle.get_matched_indices())
 
         return handle, table_idx
 
@@ -123,7 +156,9 @@ class PrefillManager:
     def add_one_req(self, req: UserMsg) -> None:
         self.pending_list.append(PendingReq(req.uid, req.input_ids, req.sampling_params))
 
-    def schedule_next_batch(self, prefill_budget: int) -> Batch | None:
+    def schedule_next_batch(
+        self, prefill_budget: int, *, allow_async_restore: bool = False
+    ) -> Batch | None:
         if len(self.pending_list) == 0:
             return None
 
@@ -133,6 +168,7 @@ class PrefillManager:
             reserved_size=self.decode_manager.inflight_tokens,
             cache_manager=self.cache_manager,
             table_manager=self.table_manager,
+            allow_async_restore=allow_async_restore,
         )
         reqs: List[Req] = []
         chunked_list: List[PendingReq] = []
@@ -154,6 +190,11 @@ class PrefillManager:
         for i, req in enumerate(self.pending_list):
             if req.uid == uid:
                 self.pending_list.pop(i)
+                if req.materialization is not None:
+                    table_idx = req.materialization.table_idx
+                    self.cache_manager.cancel_materialization(req.materialization)
+                    self.table_manager.free(table_idx)
+                    req.materialization = None
                 return req.chunked_req
         return None
 

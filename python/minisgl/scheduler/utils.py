@@ -8,6 +8,7 @@ import torch
 if TYPE_CHECKING:
     from minisgl.core import SamplingParams
 
+    from .cache import PendingMaterialization
     from .prefill import ChunkedReq
 
 
@@ -17,6 +18,7 @@ class PendingReq:
     input_ids: torch.Tensor
     sampling_params: SamplingParams
     chunked_req: ChunkedReq | None = None
+    materialization: PendingMaterialization | None = None
 
     @property
     def input_len(self) -> int:

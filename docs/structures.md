@@ -37,7 +37,8 @@ The source code is located in `python/minisgl`. Here is a breakdown of the modul
 - `minisgl.layers`: Implements basic building blocks for building LLMs with TP support, including linear, layernorm, embedding, RoPE, etc. They share common base classes defined in `minisgl.layers.base`.
 - `minisgl.models`: Implements LLM models, including Llama and Qwen3. Also defines utilities for loading weights from huggingface and sharding weights.
 - `minisgl.attention`: Provides interface of attention Backends and implements backends of `flashattention` and `flashinfer`. They are called by `AttentionLayer` and use metadata stored in `Context`.
-- `minisgl.kvcache`: Provides interface of KVCache pool and KVCache manager, and implements `MHAKVCache`, `NaiveCacheManager` and `RadixCacheManager`.
+- `minisgl.kvcache`: Provides KV pool and prefix-cache interfaces; implements GPU and pinned-host
+  MHA pools, fixed-slot storage, transfer tickets, and naive/Radix cache managers.
 - `minisgl.utils`: Provides a collection of utilities, including logger setup and wrappers around zmq.
 - `minisgl.engine`: Implements `Engine` class, which is a TP worker on a single process. It manages the model, context, KVCache, attention backend and cuda graph replaying.
 - `minisgl.message`: Defines messages exchanged (in zmq) between api_server, tokenizer, detokenizer and scheduler. All message types support automatic serialization and deserialization.

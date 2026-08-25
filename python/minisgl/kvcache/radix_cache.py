@@ -94,6 +94,8 @@ class RadixCacheHandle(BaseCacheHandle):
         while not node.is_root():
             value_list.append(node.value)
             node = node.parent
+        if not value_list:
+            return node.value
         value_list.reverse()
         return torch.cat(value_list)
 
@@ -108,6 +110,7 @@ class RadixPrefixCache(BasePrefixCache):
         self.evictable_size = 0
         self.protected_size = 0
         self.root_node = RadixTreeNode(self.key_fn)
+        self.root_node.set_key_value(torch.empty(0, dtype=torch.int32), self.empty_tensor)
         self.root_node.ref_count = 1  # root is always protected
 
     def lock_handle(self, handle: BaseCacheHandle, unlock: bool = False) -> None:
@@ -175,7 +178,11 @@ class RadixPrefixCache(BasePrefixCache):
         return torch.cat(evicted_indices)
 
     def reset(self) -> None:
-        raise NotImplementedError("RadixManager.reset is not implemented")
+        self.evictable_size = 0
+        self.protected_size = 0
+        self.root_node = RadixTreeNode(self.key_fn)
+        self.root_node.set_key_value(torch.empty(0, dtype=torch.int32), self.empty_tensor)
+        self.root_node.ref_count = 1
 
     @property
     def size_info(self) -> SizeInfo:
@@ -185,7 +192,42 @@ class RadixPrefixCache(BasePrefixCache):
         )
 
     def check_integrity(self) -> None:
-        pass
+        evictable_size = 0
+        protected_size = 0
+        owned_indices: List[int] = []
+        nodes = [self.root_node]
+
+        if not self.root_node.is_root() or self.root_node.ref_count != 1:
+            raise RuntimeError("Radix cache root is corrupted")
+
+        while nodes:
+            parent = nodes.pop()
+            for child_key, child in parent.children.items():
+                if child.parent is not parent:
+                    raise RuntimeError("Radix cache parent link is corrupted")
+                if self.key_fn(child._key) != child_key:
+                    raise RuntimeError("Radix cache child key is corrupted")
+                if child.length <= 0 or child.length % self.page_size != 0:
+                    raise RuntimeError("Radix cache node is not page aligned")
+                if child.length != len(child._key) or child.length != len(child.value):
+                    raise RuntimeError("Radix cache key/value lengths differ")
+                if child.ref_count < 0:
+                    raise RuntimeError("Radix cache node has a negative reference count")
+                if child.ref_count == 0:
+                    evictable_size += child.length
+                else:
+                    protected_size += child.length
+                owned_indices.extend(child.value.detach().cpu().tolist())
+                nodes.append(child)
+
+        if evictable_size != self.evictable_size or protected_size != self.protected_size:
+            raise RuntimeError(
+                "Radix cache size accounting mismatch:"
+                f" expected ({self.evictable_size}, {self.protected_size}),"
+                f" found ({evictable_size}, {protected_size})"
+            )
+        if len(owned_indices) != len(set(owned_indices)):
+            raise RuntimeError("Radix cache contains duplicate physical indices")
 
     def _collect_leave_nodes_for_evict(self) -> List[RadixTreeNode]:
         nodes: List[RadixTreeNode] = [self.root_node]

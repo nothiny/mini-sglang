@@ -61,7 +61,17 @@ class InsertResult(NamedTuple):
 
 class MatchResult(NamedTuple):
     cuda_handle: BaseCacheHandle
-    # TODO: support HiCache
+    host_handle: BaseCacheHandle | None = None
+    storage_handle: BaseCacheHandle | None = None
+
+    @property
+    def best_handle(self) -> BaseCacheHandle:
+        handles = [
+            handle
+            for handle in (self.cuda_handle, self.host_handle, self.storage_handle)
+            if handle is not None
+        ]
+        return max(handles, key=lambda handle: handle.cached_len)
 
 
 class BasePrefixCache(ABC):

@@ -211,6 +211,103 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     )
 
     parser.add_argument(
+        "--enable-hicache",
+        action="store_true",
+        help="Enable hierarchical KV caching in pinned RAM and optional local storage.",
+    )
+    parser.add_argument(
+        "--hicache-size-gb",
+        "--hicache-host-size-gb",
+        type=float,
+        default=ServerArgs.hicache_size_gb,
+        help="Pinned-RAM L2 capacity in GiB. Overrides --hicache-ratio.",
+    )
+    parser.add_argument(
+        "--hicache-ratio",
+        type=float,
+        default=ServerArgs.hicache_ratio,
+        help="Pinned-RAM L2 capacity relative to the GPU KV page count.",
+    )
+    parser.add_argument(
+        "--hicache-storage-size-gb",
+        type=float,
+        default=ServerArgs.hicache_storage_size_gb,
+        help="File-backed L3 capacity in GiB. Overrides --hicache-storage-ratio.",
+    )
+    parser.add_argument(
+        "--hicache-storage-ratio",
+        type=float,
+        default=ServerArgs.hicache_storage_ratio,
+        help="File-backed L3 capacity relative to the GPU KV page count.",
+    )
+    parser.add_argument(
+        "--hicache-storage-path",
+        type=str,
+        default=ServerArgs.hicache_storage_path,
+        help="L3 data-file path. A temporary process-scoped file is used when omitted.",
+    )
+    parser.add_argument(
+        "--hicache-io-workers",
+        type=int,
+        default=ServerArgs.hicache_io_workers,
+        help="Number of asynchronous L3 pread/pwrite workers.",
+    )
+    parser.add_argument(
+        "--hicache-staging-pages",
+        type=int,
+        default=ServerArgs.hicache_staging_pages,
+        help="Pinned pages reserved for chunked GPU/storage transfers.",
+    )
+    parser.add_argument(
+        "--disable-hicache-storage-promotion",
+        action="store_false",
+        dest="hicache_promote_storage",
+        help="Restore L3 hits directly without retaining a promoted L2 copy.",
+    )
+    parser.add_argument(
+        "--hicache-policy",
+        choices=["cost", "always"],
+        default=ServerArgs.hicache_policy,
+        help="Choose restores with the online cost model or always use the longest hit.",
+    )
+    parser.add_argument(
+        "--hicache-recompute-us-per-token",
+        type=float,
+        default=ServerArgs.hicache_recompute_us_per_token,
+        help="Initial prefill recomputation prior; updated online from observed batches.",
+    )
+    parser.add_argument(
+        "--hicache-host-bandwidth-gib-s",
+        type=float,
+        default=ServerArgs.hicache_host_bandwidth_gib_s,
+        help="Initial bidirectional GPU/host bandwidth estimate in GiB/s.",
+    )
+    parser.add_argument(
+        "--hicache-storage-bandwidth-gib-s",
+        type=float,
+        default=ServerArgs.hicache_storage_bandwidth_gib_s,
+        help="Initial local-storage bandwidth estimate in GiB/s.",
+    )
+    parser.add_argument(
+        "--hicache-cost-margin",
+        type=float,
+        default=ServerArgs.hicache_cost_margin,
+        help="Required recompute/transfer advantage before cost-based admission.",
+    )
+    parser.add_argument(
+        "--disable-hicache-prefetch",
+        action="store_false",
+        dest="hicache_prefetch",
+        help="Disable lower-tier restore overlap with in-flight decode batches.",
+    )
+    parser.add_argument(
+        "--hicache-transfer-backend",
+        choices=["auto", "triton", "torch"],
+        default=ServerArgs.hicache_transfer_backend,
+        help="GPU page packing backend; auto tunes gather and scatter independently.",
+    )
+
+    parser.add_argument(
         "--moe-backend",
         default=ServerArgs.moe_backend,
         choices=["auto"] + SUPPORTED_MOE_BACKENDS.supported_names(),

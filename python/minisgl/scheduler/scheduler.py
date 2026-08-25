@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
+from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias, cast
 
 import torch
 from minisgl.core import Batch, Req
 from minisgl.env import ENV
+from minisgl.kvcache import MHAKVCache
 from minisgl.message import (
     AbortBackendMsg,
     BaseBackendMsg,
@@ -57,8 +58,28 @@ class Scheduler(SchedulerIOMixin):
         # initialize other managers
         self.table_manager = TableManager(config.max_running_req, self.engine.page_table)
         self.cache_manager = CacheManager(
-            self.engine.num_pages, config.page_size, self.engine.page_table, config.cache_type
+            self.engine.num_pages,
+            config.page_size,
+            self.engine.page_table,
+            config.cache_type,
+            kv_cache=cast(MHAKVCache, self.engine.kv_cache),
+            enable_hicache=config.enable_hicache,
+            hicache_size_gb=config.hicache_size_gb,
+            hicache_ratio=config.hicache_ratio,
+            hicache_storage_size_gb=config.hicache_storage_size_gb,
+            hicache_storage_ratio=config.hicache_storage_ratio,
+            hicache_storage_path=config.hicache_storage_path,
+            hicache_io_workers=config.hicache_io_workers,
+            hicache_staging_pages=config.hicache_staging_pages,
+            hicache_promote_storage=config.hicache_promote_storage,
+            hicache_policy=config.hicache_policy,
+            hicache_recompute_us_per_token=config.hicache_recompute_us_per_token,
+            hicache_host_bandwidth_gib_s=config.hicache_host_bandwidth_gib_s,
+            hicache_storage_bandwidth_gib_s=config.hicache_storage_bandwidth_gib_s,
+            hicache_cost_margin=config.hicache_cost_margin,
+            hicache_transfer_backend=config.hicache_transfer_backend,
         )
+        self.hicache_prefetch = config.hicache_prefetch
         self.decode_manager = DecodeManager(config.page_size)
         self.prefill_manager = PrefillManager(
             self.cache_manager, self.table_manager, self.decode_manager
@@ -95,7 +116,14 @@ class Scheduler(SchedulerIOMixin):
         for msg in self.receive_msg(blocking=blocking):
             self._process_one_msg(msg)
 
-        forward_input = self._schedule_next_batch()
+        allow_async_restore = self.hicache_prefetch and (
+            last_data is not None or self.decode_manager.runnable
+        )
+        forward_input = self._schedule_next_batch(allow_async_restore=allow_async_restore)
+        if (last_data is not None and last_data[0].batch.is_decode) or (
+            forward_input is not None and forward_input.batch.is_decode
+        ):
+            self.cache_manager.mark_materializations_overlapped()
         ongoing_data = None
         if forward_input is not None:
             with self.engine_stream_ctx:  # run the batch in the engine's stream
@@ -110,7 +138,7 @@ class Scheduler(SchedulerIOMixin):
         for msg in self.receive_msg(blocking=blocking):
             self._process_one_msg(msg)
 
-        forward_input = self._schedule_next_batch()
+        forward_input = self._schedule_next_batch(allow_async_restore=False)
         ongoing_data = None
         if forward_input is not None:
             ongoing_data = (forward_input, self._forward(forward_input))
@@ -133,23 +161,28 @@ class Scheduler(SchedulerIOMixin):
     def shutdown(self) -> None:
         torch.cuda.synchronize(self.device)
         self.sync_all_ranks()
+        self.cache_manager.shutdown()
         self.engine.shutdown()
 
     def _process_last_data(self, last_data: ForwardData | None) -> None:
         if last_data is None:
             return
 
-        batch, (_, next_tokens_cpu, copy_done) = last_data[0].batch, last_data[1]
+        batch, output = last_data[0].batch, last_data[1]
+        next_tokens_cpu, copy_done = output.next_tokens_cpu, output.copy_done_event
         copy_done.synchronize()
+        if batch.is_prefill:
+            forward_seconds = output.forward_start_event.elapsed_time(copy_done) / 1000
+            self.cache_manager.observe_prefill(output.extend_tokens, forward_seconds)
         reply: List[DetokenizeMsg] = []
         new_finished_reqs: Set[Req] = set()
         with self.cache_manager.lazy_free_region():
             for i, req in enumerate(batch.reqs):
                 if isinstance(req, ChunkedReq):
                     continue
-                next_token = next_tokens_cpu[i]
-                req.append_host(next_token.unsqueeze(0))
-                next_token = int(next_token.item())
+                next_token_tensor = next_tokens_cpu[i]
+                req.append_host(next_token_tensor.unsqueeze(0))
+                next_token = int(next_token_tensor.item())
                 finished = not req.can_decode
                 if not req.sampling_params.ignore_eos:
                     finished |= next_token == self.eos_token_id
@@ -177,10 +210,11 @@ class Scheduler(SchedulerIOMixin):
             input_len, max_seq_len = len(msg.input_ids), self.engine.max_seq_len
             max_output_len = max_seq_len - input_len
             if max_output_len <= 0:
-                return logger.warning_rank0(
+                logger.warning_rank0(
                     f"Input sequence length {input_len} exceeds {max_seq_len}, "
                     f"request {msg.uid} is dropped."
                 )
+                return
             if msg.sampling_params.max_tokens > max_output_len:
                 msg.sampling_params.max_tokens = max_output_len
                 logger.warning_rank0(
@@ -216,10 +250,12 @@ class Scheduler(SchedulerIOMixin):
             write_tuple=write_mapping,
         )
 
-    def _schedule_next_batch(self) -> ForwardInput | None:
+    def _schedule_next_batch(self, *, allow_async_restore: bool) -> ForwardInput | None:
         # TODO: support other policies: e.g. DECODE first
         batch = (
-            self.prefill_manager.schedule_next_batch(self.prefill_budget)
+            self.prefill_manager.schedule_next_batch(
+                self.prefill_budget, allow_async_restore=allow_async_restore
+            )
             or self.decode_manager.schedule_next_batch()
         )
         return self._prepare_batch(batch) if batch else None

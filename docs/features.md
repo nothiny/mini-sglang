@@ -51,6 +51,30 @@ Adopting the original design from [SGLang](https://github.com/sgl-project/sglang
 ![radix](https://lmsys.org/images/blog/sglang/radix_attn.jpg)
 *Illustration of Radix Attention from [LMSYS Blog](https://lmsys.org/blog/2024-01-17-sglang/).*
 
+## Hierarchical KV Cache
+
+Mini-HiCache can retain Radix Cache pages in pinned host memory (L2) and a fixed-slot local
+storage file (L3) after GPU eviction. Lower-tier hits are restored before prefill, while new
+pages are written through asynchronously. Fused Triton page packing, coalesced file extents,
+and decode-overlapped restoration reduce data-movement overhead. The default online cost
+policy skips a lower-tier hit when recomputation is predicted to be faster. The feature is
+disabled by default and currently supports MHA models with the Radix Cache.
+
+```bash
+python -m minisgl --model "Qwen/Qwen3-0.6B" --attn fi \
+    --enable-hicache --hicache-ratio 1.0 \
+    --hicache-storage-ratio 4.0 \
+    --hicache-storage-path /mnt/nvme/minisgl-cache.kv \
+    --hicache-policy cost --hicache-transfer-backend auto
+```
+
+The explicit storage file is truncated at startup and its metadata is process scoped. Omit
+`--hicache-storage-path` to use an automatically removed temporary file. See the
+[Mini-HiCache design](./hicache_design.md) for capacity controls, ownership invariants, and
+validation details. Use `benchmark/offline/bench_hicache.py` for forced-tier latency,
+`benchmark/offline/bench_hicache_overlap.py` to verify L3 restore/decode overlap, and
+`benchmark/offline/bench_hicache_stress.py` for multi-prefix throughput and tail latency.
+
 ## Overlap Scheduling
 
 To further reduce CPU overhead, Mini-SGLang employs overlap scheduling, a technique proposed in [NanoFlow](https://arxiv.org/abs/2408.12757). This approach overlaps the CPU scheduling overhead with GPU computation, improving overall system throughput.

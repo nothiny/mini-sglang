@@ -24,6 +24,8 @@ class ForwardOutput(NamedTuple):
     next_tokens_gpu: torch.Tensor
     next_tokens_cpu: torch.Tensor
     copy_done_event: torch.cuda.Event
+    forward_start_event: torch.cuda.Event
+    extend_tokens: int
 
 
 class Engine:
@@ -190,6 +192,9 @@ class Engine:
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
+        extend_tokens = sum(req.extend_len for req in batch.reqs)
+        forward_start_event = torch.cuda.Event(enable_timing=True)
+        forward_start_event.record(self.stream)
         with self.ctx.forward_batch(batch):
             if self.graph_runner.can_use_cuda_graph(batch):
                 logits = self.graph_runner.replay(batch)
@@ -201,9 +206,15 @@ class Engine:
 
         next_tokens_gpu = self.sampler.sample(logits[: batch.size], args).to(torch.int32)
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
-        copy_done_event = torch.cuda.Event()
+        copy_done_event = torch.cuda.Event(enable_timing=True)
         copy_done_event.record(self.stream)
-        return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
+        return ForwardOutput(
+            next_tokens_gpu,
+            next_tokens_cpu,
+            copy_done_event,
+            forward_start_event,
+            extend_tokens,
+        )
 
     def shutdown(self) -> None:
         self.graph_runner.destroy_cuda_graphs()
@@ -215,8 +226,8 @@ def _align_up_32(num: int) -> int:
     return (num + 31) // 32 * 32
 
 
-def _adjust_config(config: EngineConfig):
-    def override(attr: str, value: Any):  # this is dangerous, use with caution
+def _adjust_config(config: EngineConfig) -> None:
+    def override(attr: str, value: Any) -> None:  # this is dangerous, use with caution
         object.__setattr__(config, attr, value)
 
     if config.attention_backend == "auto":

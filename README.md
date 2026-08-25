@@ -16,6 +16,7 @@ Mini-SGLang is a compact implementation of [SGLang](https://github.com/sgl-proje
 - **Lightweight & Readable**: A clean, modular, and fully type-annotated codebase that is easy to understand and modify.
 - **Advanced Optimizations**:
   - **Radix Cache**: Reuses KV cache for shared prefixes across requests.
+  - **Hierarchical KV Cache**: Adaptively restores reusable prefixes from pinned RAM or local storage with fused Triton transfers.
   - **Chunked Prefill**: Reduces peak memory usage for long-context serving.
   - **Overlap Scheduling**: Hides CPU scheduling overhead with GPU computation.
   - **Tensor Parallelism**: Scales inference across multiple GPUs.
@@ -184,3 +185,4 @@ python3 -m sglang.launch_server --model "Qwen/Qwen3-32B" --tp 4 \
 
 - **[Detailed Features](./docs/features.md)**: Explore all available features and command-line arguments.
 - **[System Architecture](./docs/structures.md)**: Dive deep into the design and data flow of Mini-SGLang.
+- **[Mini-HiCache Design](./docs/hicache_design.md)**: Understand the optional GPU/RAM/storage KV hierarchy.

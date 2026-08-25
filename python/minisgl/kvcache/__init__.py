@@ -15,6 +15,15 @@ from .base import (
     MatchResult,
     SizeInfo,
 )
+from .mha_pool import HostMHAKVCache, MHAKVCache
+from .tiered_pool import (
+    CacheTier,
+    CacheTransferManager,
+    StorageMHAKVCache,
+    TransferDirection,
+    TransferState,
+    TransferTicket,
+)
 
 
 class CacheManagerCreator(Protocol):
@@ -71,4 +80,12 @@ __all__ = [
     "SizeInfo",
     "MatchResult",
     "SUPPORTED_CACHE_MANAGER",
+    "MHAKVCache",
+    "HostMHAKVCache",
+    "StorageMHAKVCache",
+    "CacheTier",
+    "CacheTransferManager",
+    "TransferDirection",
+    "TransferState",
+    "TransferTicket",
 ]
