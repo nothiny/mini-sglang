@@ -17,7 +17,7 @@ restart-persistent metadata, KV compression, and MLA pools are outside the curre
 
 ```mermaid
 flowchart LR
-    R[Request] --> M{Match all Radix trees}
+    R[Request] --> M{Match shared HiRadixTree}
     M --> C{Online cost model}
     C -->|recompute| P[GPU prefill]
     C -->|L2 hit| H[L2 pinned RAM]
@@ -51,13 +51,16 @@ bytes_per_page = 2 * layers * page_size * local_kv_heads * head_dim * dtype_size
 offset(page)   = page * bytes_per_page
 ```
 
-Each tier owns an independent `RadixPrefixCache`. Its values are token indices into that
-tier's physical pool. `MatchResult` can therefore describe different matched lengths in L1,
-L2, and L3. A request's `cached_len` advances only after lower-tier bytes are ready in L1 and
-the GPU Radix tree has been published.
+The hierarchy owns one `HiRadixTree` token topology. Each node carries optional GPU, host, and
+storage values containing token indices into the corresponding physical pool. Tier-specific
+views keep independent reference counts, LRU timestamps, and size accounting while sharing
+node splits and parent/child links. One topology walk therefore produces the potentially
+different L1, L2, and L3 lengths in `MatchResult`.
 
-Independent trees deliberately duplicate small token metadata. This preserves the existing
-Radix split, lock, LRU, and page-ownership rules and lets each tier evict independently.
+Evicting one residency clears only that node's value for the selected tier. The node remains
+while another tier or a descendant still owns data, and it is removed from the shared topology
+only after all three values and references are gone. A request's `cached_len` advances only
+after lower-tier bytes are ready in L1 and the GPU value has been published.
 
 ## Fused GPU and Host Transfers
 
@@ -108,9 +111,10 @@ models or slow storage. The default `cost` policy learns the decision online. Fo
 tokens and `b` bytes per token, it estimates:
 
 ```text
-C_recompute = n * EWMA(prefill_seconds / extend_tokens)
-C_L2        = n * b * EWMA(H2D_seconds / bytes)
-C_L3        = n * b * (EWMA(S2H_seconds / bytes) + EWMA(H2D_seconds / bytes))
+C_recompute = prefill_fixed + n * prefill_seconds_per_token
+C_L2        = H2D_fixed + n * b * H2D_seconds_per_byte
+C_L3        = S2H_fixed + H2D_fixed
+              + n * b * (S2H_seconds_per_byte + H2D_seconds_per_byte)
 benefit     = C_recompute - margin * C_restore
 ```
 
@@ -119,11 +123,13 @@ the L1 hit and recomputes. Admission uses the same future restore cost, because 
 write-through is asynchronous and not part of the future request's critical path. `always`
 is retained for deterministic testing and forced-tier benchmarks.
 
-The model starts from configurable bandwidth and recomputation priors and updates them with a
-0.2 EWMA. Transfer samples include enqueue, queue wait, kernel/DMA or file service, and CPU
-completion work; one-time workspace setup is excluded. Storage read and write rates are kept
-separate because they are commonly asymmetric. Reverse-direction samples are used only for
-the approximately symmetric PCIe link.
+The model starts from configurable bandwidth and recomputation priors. For one observed size,
+it retains the slope prior and learns the positive fixed residual with a 0.2 EWMA. Once recent
+samples contain meaningfully different sizes, constrained least squares fits a non-negative
+intercept and slope over a sliding 32-sample window. Transfer samples include enqueue, queue
+wait, kernel/DMA or file service, and CPU completion work; one-time workspace setup is excluded.
+Storage read and write models are kept separate because they are commonly asymmetric.
+Reverse-direction samples are used only for the approximately symmetric PCIe link.
 
 ## Ownership and Publication State Machine
 
@@ -143,7 +149,7 @@ L3 -> S2H_PENDING -> L2_L3 -> H2D_PENDING -> L1_L2_L3
 Every pending operation reserves private destination pages and locks its published source
 handle. Metadata is committed only after the CUDA event or I/O future succeeds. Failures free
 only still-private pages, release source locks, restore the previous L1 table entry, and fall
-back to recomputation. Once insertion transfers page ownership to a Radix tree, failure
+back to recomputation. Once insertion transfers page ownership to the HiRadixTree, failure
 cleanup never returns those pages to a free list.
 
 The core invariants are:
@@ -155,8 +161,8 @@ The core invariants are:
 5. completion precedes publication, and publication precedes `Req.cached_len` updates; and
 6. after draining transfers, `free_pages + tree_pages == capacity_pages` in every tier.
 
-`RadixPrefixCache.check_integrity()` also verifies parent links, size accounting, reference
-counts, alignment, and duplicate physical indices.
+`HiRadixTree.check_integrity()` also verifies the shared parent links, per-tier size accounting,
+reference counts, alignment, contiguous tier residency, and duplicate physical indices.
 
 ## Decode-Overlapped Restoration
 
@@ -187,8 +193,9 @@ Abort and shutdown paths drain or cancel this state without leaking the request 
 
 ## Eviction, Promotion, and Tensor Parallelism
 
-Every tier uses independent LRU leaf eviction. L1 eviction never removes lower copies; L2
-eviction never removes L1 or L3; L3 eviction only releases fixed file slots. L3 restoration
+Every tier uses independent LRU leaf eviction over the shared topology. L1 eviction clears only
+the GPU value, L2 eviction clears only the host value, and L3 eviction releases only the local
+fixed-file slot. A locally empty leaf is deleted only when no tier still owns it. L3 restoration
 normally promotes the full prefix to L2, improving future reuse. Promotion can be disabled to
 avoid L2 pollution.
 

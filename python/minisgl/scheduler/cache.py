@@ -14,6 +14,7 @@ from minisgl.kvcache import (
     BasePrefixCache,
     CacheTier,
     CacheTransferManager,
+    HiRadixTree,
     HostMHAKVCache,
     MatchResult,
     MHAKVCache,
@@ -106,7 +107,9 @@ class HiCacheMetrics:
 
 
 class HiCacheCostModel:
-    """Online cost model for restore and write-through admission decisions."""
+    """Online affine cost model for restore and write-through admission decisions."""
+
+    _MAX_SAMPLES = 32
 
     def __init__(
         self,
@@ -131,6 +134,7 @@ class HiCacheCostModel:
             raise ValueError("HiCache cost-model parameters must be positive")
         self.policy = policy
         self.margin = margin
+        self.recompute_fixed_seconds = 0.0
         self.recompute_seconds_per_token = recompute_us_per_token / 1_000_000
         self._default_seconds_per_byte = {
             TransferDirection.D2H: 1 / (host_bandwidth_gib_s * (1 << 30)),
@@ -138,27 +142,44 @@ class HiCacheCostModel:
             TransferDirection.H2S: 1 / (storage_bandwidth_gib_s * (1 << 30)),
             TransferDirection.S2H: 1 / (storage_bandwidth_gib_s * (1 << 30)),
         }
+        self._prefill_samples: List[tuple[float, float]] = []
+        self._transfer_samples: Dict[TransferDirection, List[tuple[float, float]]] = {}
+        self._observed_fixed_seconds: Dict[TransferDirection, float] = {}
         self._observed_seconds_per_byte: Dict[TransferDirection, float] = {}
         self.prefill_observations = 0
         self.transfer_observations = 0
         self.estimated_saved_seconds = 0.0
 
     def observe_prefill(self, tokens: int, seconds: float) -> None:
-        # Tiny extensions are dominated by fixed scheduling and sampling overhead.
+        # Tiny extensions do not provide a useful slope sample. They are also often
+        # decode steps rather than representative prefill work.
         if tokens < 16 or seconds <= 0:
             return
-        sample = seconds / tokens
-        self.recompute_seconds_per_token = self._ewma(self.recompute_seconds_per_token, sample)
+        self.recompute_fixed_seconds, self.recompute_seconds_per_token = self._observe_affine(
+            self._prefill_samples,
+            float(tokens),
+            seconds,
+            self.recompute_fixed_seconds,
+            self.recompute_seconds_per_token,
+        )
         self.prefill_observations += 1
 
     def observe_transfer(self, ticket: TransferTicket) -> None:
         if ticket.num_bytes <= 0 or ticket.state.value != "completed":
             return
-        sample = ticket.recurring_seconds / ticket.num_bytes
-        previous = self._observed_seconds_per_byte.get(
+        direction = ticket.direction
+        previous_slope = self._observed_seconds_per_byte.get(
             ticket.direction, self._default_seconds_per_byte[ticket.direction]
         )
-        self._observed_seconds_per_byte[ticket.direction] = self._ewma(previous, sample)
+        fixed, slope = self._observe_affine(
+            self._transfer_samples.setdefault(direction, []),
+            float(ticket.num_bytes),
+            ticket.recurring_seconds,
+            self._observed_fixed_seconds.get(direction, 0.0),
+            previous_slope,
+        )
+        self._observed_fixed_seconds[direction] = fixed
+        self._observed_seconds_per_byte[direction] = slope
         self.transfer_observations += 1
 
     def select_restore(
@@ -215,7 +236,7 @@ class HiCacheCostModel:
         if self.policy == "always":
             return True
         num_bytes = tokens * bytes_per_token
-        recompute = tokens * self.recompute_seconds_per_token
+        recompute = self._estimate_recompute(tokens)
         directions: tuple[TransferDirection, ...]
         if tier == CacheTier.HOST:
             directions = (TransferDirection.H2D,)
@@ -231,6 +252,7 @@ class HiCacheCostModel:
         result: Dict[str, int | float | str] = {
             "policy": self.policy,
             "margin": self.margin,
+            "recompute_fixed_ms": self.recompute_fixed_seconds * 1000,
             "recompute_us_per_token": self.recompute_seconds_per_token * 1_000_000,
             "prefill_observations": self.prefill_observations,
             "transfer_observations": self.transfer_observations,
@@ -239,6 +261,9 @@ class HiCacheCostModel:
         for direction in TransferDirection:
             seconds_per_byte = self._observed_seconds_per_byte.get(
                 direction, self._default_seconds_per_byte[direction]
+            )
+            result[f"estimated_{direction.value}_fixed_ms"] = (
+                self._observed_fixed_seconds.get(direction, 0.0) * 1000
             )
             result[f"estimated_{direction.value}_gib_s"] = 1 / (seconds_per_byte * (1 << 30))
         return result
@@ -251,13 +276,17 @@ class HiCacheCostModel:
     ) -> float:
         if self.policy == "always":
             return float(tokens)
-        recompute = tokens * self.recompute_seconds_per_token
+        recompute = self._estimate_recompute(tokens)
         num_bytes = tokens * bytes_per_token
         transfer = sum(self._estimate_transfer(direction, num_bytes) for direction in directions)
         return recompute - transfer * self.margin
 
+    def _estimate_recompute(self, tokens: int) -> float:
+        return self.recompute_fixed_seconds + tokens * self.recompute_seconds_per_token
+
     def _estimate_transfer(self, direction: TransferDirection, num_bytes: int) -> float:
         rate = self._observed_seconds_per_byte.get(direction)
+        fixed = self._observed_fixed_seconds.get(direction)
         if rate is None and direction in {
             TransferDirection.D2H,
             TransferDirection.H2D,
@@ -270,12 +299,65 @@ class HiCacheCostModel:
             rate = self._observed_seconds_per_byte.get(
                 reverse, self._default_seconds_per_byte[direction]
             )
+            fixed = self._observed_fixed_seconds.get(reverse, 0.0)
         elif rate is None:
             # Storage read and write throughput is commonly asymmetric.  A slow
             # write-through observation must not suppress a potentially fast read
             # before the first restore has supplied an S2H sample.
             rate = self._default_seconds_per_byte[direction]
-        return num_bytes * rate
+            fixed = 0.0
+        return (fixed or 0.0) + num_bytes * rate
+
+    @classmethod
+    def _observe_affine(
+        cls,
+        samples: List[tuple[float, float]],
+        size: float,
+        seconds: float,
+        previous_fixed: float,
+        previous_slope: float,
+    ) -> tuple[float, float]:
+        """Fit ``seconds = fixed + size * slope`` over a small recent window.
+
+        A single transfer size cannot identify both terms. Until differently-sized
+        samples arrive, keep the bandwidth prior and learn only its positive residual
+        as fixed overhead. Once the window has useful size variance, use constrained
+        least squares so neither latency nor marginal cost can become negative.
+        """
+        samples.append((size, seconds))
+        if len(samples) > cls._MAX_SAMPLES:
+            del samples[: len(samples) - cls._MAX_SAMPLES]
+
+        sizes = [sample_size for sample_size, _ in samples]
+        minimum = min(sizes)
+        maximum = max(sizes)
+        if maximum - minimum <= max(1.0, maximum * 0.05):
+            residual = seconds - size * previous_slope
+            if residual >= 0:
+                return cls._ewma(previous_fixed, residual), previous_slope
+            adjusted_slope = max(0.0, (seconds - previous_fixed) / size)
+            return previous_fixed, cls._ewma(previous_slope, adjusted_slope)
+
+        count = float(len(samples))
+        mean_size = sum(sizes) / count
+        mean_seconds = sum(sample_seconds for _, sample_seconds in samples) / count
+        variance = sum((sample_size - mean_size) ** 2 for sample_size in sizes)
+        covariance = sum(
+            (sample_size - mean_size) * (sample_seconds - mean_seconds)
+            for sample_size, sample_seconds in samples
+        )
+        fitted_slope = covariance / variance
+        if fitted_slope < 0:
+            return max(0.0, mean_seconds), 0.0
+        fitted_fixed = mean_seconds - fitted_slope * mean_size
+        if fitted_fixed < 0:
+            denominator = sum(sample_size * sample_size for sample_size in sizes)
+            fitted_slope = (
+                sum(sample_size * sample_seconds for sample_size, sample_seconds in samples)
+                / denominator
+            )
+            fitted_fixed = 0.0
+        return fitted_fixed, max(0.0, fitted_slope)
 
     @staticmethod
     def _ewma(previous: float, sample: float, alpha: float = 0.2) -> float:
@@ -335,13 +417,20 @@ class PendingMaterialization:
 
 
 class _LowerTierManager:
-    """Page allocator plus Radix Tree metadata for one non-GPU tier."""
+    """Page allocator plus a tier-local view of the shared HiRadixTree."""
 
-    def __init__(self, name: str, num_pages: int, page_size: int) -> None:
+    def __init__(
+        self,
+        name: str,
+        num_pages: int,
+        page_size: int,
+        *,
+        prefix_cache: BasePrefixCache | None = None,
+    ) -> None:
         self.name = name
         self.num_pages = num_pages
         self.page_size = page_size
-        self.prefix_cache: BasePrefixCache = create_prefix_cache(
+        self.prefix_cache = prefix_cache or create_prefix_cache(
             device=torch.device("cpu"), type="radix"
         )
         self.free_slots = torch.arange(num_pages, dtype=torch.int32) * page_size
@@ -456,6 +545,7 @@ class CacheManager:
         self.host_tier: _LowerTierManager | None = None
         self.storage_tier: _LowerTierManager | None = None
         self.transfer_manager: CacheTransferManager | None = None
+        self.hicache_tree: HiRadixTree | None = None
         self._pending_host_backups: List[_PendingHostBackup] = []
         self._pending_storage_backups: List[_PendingStorageBackup] = []
         self._pending_materializations: List[PendingMaterialization] = []
@@ -488,14 +578,33 @@ class CacheManager:
             allow_zero=True,
         )
 
+        self.hicache_tree = HiRadixTree(
+            page_size=page_size,
+            tier_devices={
+                CacheTier.GPU: device,
+                CacheTier.HOST: torch.device("cpu"),
+                CacheTier.STORAGE: torch.device("cpu"),
+            },
+        )
+        self.prefix_cache = self.hicache_tree.view(CacheTier.GPU)
         self.host_pool = HostMHAKVCache.from_device_pool(kv_cache, host_pages)
-        self.host_tier = _LowerTierManager("HiCache L2", host_pages, page_size)
+        self.host_tier = _LowerTierManager(
+            "HiCache L2",
+            host_pages,
+            page_size,
+            prefix_cache=self.hicache_tree.view(CacheTier.HOST),
+        )
         if storage_pages > 0:
             storage_path = self._resolve_storage_path(hicache_storage_path)
             self.storage_pool = StorageMHAKVCache.from_device_pool(
                 kv_cache, storage_pages, path=storage_path
             )
-            self.storage_tier = _LowerTierManager("HiCache L3", storage_pages, page_size)
+            self.storage_tier = _LowerTierManager(
+                "HiCache L3",
+                storage_pages,
+                page_size,
+                prefix_cache=self.hicache_tree.view(CacheTier.STORAGE),
+            )
 
         self.transfer_manager = CacheTransferManager(
             device_pool=kv_cache,
@@ -1439,6 +1548,10 @@ class CacheManager:
             self.host_tier.prefix_cache.lock_handle(pending.source_host_handle, unlock=True)
 
     def _match_prefixes(self, input_ids: torch.Tensor) -> MatchResult:
+        if self.hicache_tree is not None:
+            return self.hicache_tree.match_prefixes(
+                input_ids, include_storage=self.storage_tier is not None
+            )
         cuda_handle = self.prefix_cache.match_prefix(input_ids).cuda_handle
         host_handle = None
         storage_handle = None

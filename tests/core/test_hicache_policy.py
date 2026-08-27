@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from minisgl.kvcache import CacheTier, TransferDirection
+import pytest
+
+from minisgl.kvcache import CacheTier, TransferDirection, TransferTicket
+from minisgl.kvcache.tiered_pool import TransferState
 from minisgl.scheduler.cache import HiCacheCostModel
 
 
@@ -52,10 +55,45 @@ def test_cost_policy_skips_restore_when_recompute_is_cheaper():
 
 def test_prefill_observations_update_recompute_prior():
     model = _cost_model(recompute_us_per_token=10.0)
-    before = model.recompute_seconds_per_token
+    before = model._estimate_recompute(100)
     model.observe_prefill(tokens=100, seconds=0.1)
-    assert model.recompute_seconds_per_token > before
+    assert model._estimate_recompute(100) > before
+    assert model.recompute_fixed_seconds > 0
     assert model.prefill_observations == 1
+
+
+def test_affine_cost_model_learns_short_recompute_long_restore_crossover():
+    model = _cost_model(
+        recompute_us_per_token=20.0,
+        host_bandwidth_gib_s=1 / (5e-6 * (1 << 10)),
+    )
+    bytes_per_token = 1024
+    for tokens in (32, 512, 32, 512):
+        model.observe_prefill(tokens=tokens, seconds=0.001 + tokens * 20e-6)
+        num_bytes = tokens * bytes_per_token
+        model.observe_transfer(
+            _completed_transfer(
+                TransferDirection.H2D,
+                num_bytes,
+                seconds=0.004 + tokens * 5e-6,
+            )
+        )
+
+    assert model.select_restore(
+        cuda_len=0,
+        host_len=32,
+        storage_len=0,
+        bytes_per_token=bytes_per_token,
+    ) == (CacheTier.GPU, 0)
+    assert model.select_restore(
+        cuda_len=0,
+        host_len=512,
+        storage_len=0,
+        bytes_per_token=bytes_per_token,
+    ) == (CacheTier.HOST, 512)
+    snapshot = model.snapshot()
+    assert float(snapshot["recompute_fixed_ms"]) == pytest.approx(1.0)
+    assert float(snapshot["estimated_h2d_fixed_ms"]) == pytest.approx(4.0)
 
 
 def test_backup_admission_charges_only_future_restore_path():
@@ -72,3 +110,24 @@ def test_storage_write_observation_does_not_poison_read_prior():
     model = _cost_model()
     model._observed_seconds_per_byte[TransferDirection.H2S] = 1.0
     assert model._estimate_transfer(TransferDirection.S2H, 1024) < 1.0
+
+
+def _completed_transfer(
+    direction: TransferDirection, num_bytes: int, *, seconds: float
+) -> TransferTicket:
+    source = CacheTier.HOST
+    destination = CacheTier.GPU
+    ticket = TransferTicket(
+        direction=direction,
+        source=source,
+        destination=destination,
+        pages=1,
+        num_bytes=num_bytes,
+        created_at=0.0,
+        submitted_at=0.0,
+        started_at=0.0,
+        work_completed_at=seconds,
+        completed_at=seconds,
+        state=TransferState.COMPLETED,
+    )
+    return ticket

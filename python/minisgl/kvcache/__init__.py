@@ -15,6 +15,7 @@ from .base import (
     MatchResult,
     SizeInfo,
 )
+from .hi_radix_cache import HiRadixCacheHandle, HiRadixPrefixCache, HiRadixTree
 from .mha_pool import HostMHAKVCache, MHAKVCache
 from .tiered_pool import (
     CacheTier,
@@ -82,6 +83,9 @@ __all__ = [
     "SUPPORTED_CACHE_MANAGER",
     "MHAKVCache",
     "HostMHAKVCache",
+    "HiRadixCacheHandle",
+    "HiRadixPrefixCache",
+    "HiRadixTree",
     "StorageMHAKVCache",
     "CacheTier",
     "CacheTransferManager",

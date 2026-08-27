@@ -84,6 +84,25 @@ def test_transfer_round_trip_across_all_tiers(tmp_path, copy_backend: str):
     storage.close()
 
 
+def test_triton_scatter_waits_for_page_ids_producer_stream():
+    device = _make_device_pool(num_pages=64, page_size=1)
+    host = HostMHAKVCache.from_device_pool(device, device.num_pages)
+    transfers = CacheTransferManager(device, host, None, staging_pages=2, copy_backend="triton")
+    host.buffer.copy_(torch.arange(host.buffer.numel(), dtype=host.dtype).view(host.buffer.shape))
+    device.buffer.zero_()
+    host_indices = torch.arange(device.num_pages, dtype=torch.int32)
+    device_indices = host_indices.to(device="cuda")
+
+    # Keep the producer stream busy immediately before host_to_device creates its
+    # private CUDA page-id tensor.  The transfer stream must not consume that tensor
+    # until the producer stream has initialized it.
+    torch.cuda._sleep(10_000_000)
+    transfers.host_to_device(host_indices, device_indices).wait()
+
+    assert torch.equal(device.buffer.cpu(), host.buffer)
+    transfers.shutdown()
+
+
 @pytest.mark.parametrize("page_size", [1, 2, 4])
 def test_cache_manager_restores_l3_after_l1_and_l2_eviction(tmp_path, page_size: int):
     num_pages = 6

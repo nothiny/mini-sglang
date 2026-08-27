@@ -597,6 +597,11 @@ class CacheTransferManager:
                 torch.index_select(host_pool.page_buffer, 0, host_page_ids, out=packed_host)
                 host_source = packed_host
             with torch.cuda.stream(self.stream):
+                # device_page_ids is produced on the caller's current stream.  Triton
+                # consumes it directly, so make the transfer stream wait for that
+                # initialization before launching the scatter kernel.  PyTorch's
+                # index_copy_ happened to hide this race in many small workloads.
+                self.stream.wait_stream(torch.cuda.current_stream(self.device_pool.device))
                 start_event = torch.cuda.Event(enable_timing=True)
                 start_event.record(self.stream)
                 packed_device.copy_(host_source, non_blocking=True)
