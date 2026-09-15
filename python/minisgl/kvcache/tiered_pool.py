@@ -212,8 +212,31 @@ class StorageMHAKVCache:
         host_indices: torch.Tensor,
         storage_indices: torch.Tensor,
     ) -> int:
-        host_pages = page_ids_from_token_indices(host_indices, self.page_size)
-        storage_pages = page_ids_from_token_indices(storage_indices, self.page_size)
+        return self.write_pages(
+            host_pool,
+            page_ids_from_token_indices(host_indices, self.page_size),
+            page_ids_from_token_indices(storage_indices, self.page_size),
+        )
+
+    def read_pages_to_host(
+        self,
+        storage_indices: torch.Tensor,
+        host_pool: HostMHAKVCache,
+        host_indices: torch.Tensor,
+    ) -> int:
+        return self.read_pages(
+            page_ids_from_token_indices(storage_indices, self.page_size),
+            host_pool,
+            page_ids_from_token_indices(host_indices, self.page_size),
+        )
+
+    def write_pages(
+        self,
+        host_pool: HostMHAKVCache,
+        host_pages: List[int],
+        storage_pages: List[int],
+    ) -> int:
+        """Store pre-parsed complete pages, coalescing adjacent runs into extents."""
         if len(host_pages) != len(storage_pages):
             raise ValueError("Source and destination storage page counts differ")
         self._validate_page_range(storage_pages)
@@ -228,14 +251,13 @@ class StorageMHAKVCache:
             self._pwrite_all(data, storage_pages[first] * self.bytes_per_page)
         return len(extents)
 
-    def read_pages_to_host(
+    def read_pages(
         self,
-        storage_indices: torch.Tensor,
+        storage_pages: List[int],
         host_pool: HostMHAKVCache,
-        host_indices: torch.Tensor,
+        host_pages: List[int],
     ) -> int:
-        storage_pages = page_ids_from_token_indices(storage_indices, self.page_size)
-        host_pages = page_ids_from_token_indices(host_indices, self.page_size)
+        """Restore pre-parsed complete pages, coalescing adjacent runs into extents."""
         if len(host_pages) != len(storage_pages):
             raise ValueError("Source and destination storage page counts differ")
         self._validate_page_range(storage_pages)
@@ -311,12 +333,17 @@ class StorageMHAKVCache:
 
 @dataclass
 class _PackedPageWorkspace:
-    """Reusable page-packed buffers for one fused gather/DMA/scatter transfer."""
+    """Reusable page-packed buffers for one fused gather/DMA/scatter transfer.
+
+    ``host`` is only needed when the host side is physically fragmented; the common
+    contiguous case reads or writes the pinned L2 pool directly. Pinned allocations
+    are by far the most expensive part, so they are kept lazy.
+    """
 
     pages: int
-    host: torch.Tensor
     device: torch.Tensor
     busy: bool = False
+    host: torch.Tensor | None = None
 
 
 class CacheTransferManager:
@@ -373,22 +400,24 @@ class CacheTransferManager:
         self, host_indices: torch.Tensor, storage_indices: torch.Tensor
     ) -> TransferTicket:
         storage = self._require_storage()
-        pages = len(page_ids_from_token_indices(host_indices, self.page_size))
+        host_pages = page_ids_from_token_indices(host_indices, self.page_size)
+        storage_pages = page_ids_from_token_indices(storage_indices, self.page_size)
         return self._io_ticket(
             TransferDirection.H2S,
-            pages,
-            lambda: storage.write_pages_from_host(self.host_pool, host_indices, storage_indices),
+            len(host_pages),
+            lambda: storage.write_pages(self.host_pool, host_pages, storage_pages),
         )
 
     def storage_to_host(
         self, storage_indices: torch.Tensor, host_indices: torch.Tensor
     ) -> TransferTicket:
         storage = self._require_storage()
-        pages = len(page_ids_from_token_indices(storage_indices, self.page_size))
+        storage_pages = page_ids_from_token_indices(storage_indices, self.page_size)
+        host_pages = page_ids_from_token_indices(host_indices, self.page_size)
         return self._io_ticket(
             TransferDirection.S2H,
-            pages,
-            lambda: storage.read_pages_to_host(storage_indices, self.host_pool, host_indices),
+            len(storage_pages),
+            lambda: storage.read_pages(storage_pages, self.host_pool, host_pages),
         )
 
     def device_to_storage(
@@ -455,30 +484,24 @@ class CacheTransferManager:
         self, staging_indices: torch.Tensor, storage_indices: torch.Tensor
     ) -> TransferTicket:
         storage = self._require_storage()
-        pages = len(page_ids_from_token_indices(staging_indices, self.page_size))
+        staging_pages = page_ids_from_token_indices(staging_indices, self.page_size)
+        storage_pages = page_ids_from_token_indices(storage_indices, self.page_size)
         return self._io_ticket(
             TransferDirection.H2S,
-            pages,
-            lambda: storage.write_pages_from_host(
-                self.staging_pool,
-                staging_indices,
-                storage_indices,
-            ),
+            len(staging_pages),
+            lambda: storage.write_pages(self.staging_pool, staging_pages, storage_pages),
         )
 
     def _storage_to_staging(
         self, storage_indices: torch.Tensor, staging_indices: torch.Tensor
     ) -> TransferTicket:
         storage = self._require_storage()
-        pages = len(page_ids_from_token_indices(storage_indices, self.page_size))
+        storage_pages = page_ids_from_token_indices(storage_indices, self.page_size)
+        staging_pages = page_ids_from_token_indices(staging_indices, self.page_size)
         return self._io_ticket(
             TransferDirection.S2H,
-            pages,
-            lambda: storage.read_pages_to_host(
-                storage_indices,
-                self.staging_pool,
-                staging_indices,
-            ),
+            len(storage_pages),
+            lambda: storage.read_pages(storage_pages, self.staging_pool, staging_pages),
         )
 
     def _staging_chunks(
@@ -514,38 +537,43 @@ class CacheTransferManager:
 
         workspace_started_at = time.perf_counter()
         transfer_pages = len(device_pages)
-        workspace, workspace_created = self._acquire_workspace(transfer_pages)
+        host_is_consecutive = self._are_consecutive(host_pages)
+        workspace, workspace_created = self._acquire_workspace(
+            transfer_pages, needs_host=not host_is_consecutive
+        )
         workspace_setup_seconds = (
             time.perf_counter() - workspace_started_at if workspace_created else 0.0
         )
-        packed_host = workspace.host[:transfer_pages]
         packed_device = workspace.device[:transfer_pages]
         device_page_ids = torch.tensor(
             device_pages, dtype=torch.int64, device=self.device_pool.device
         )
-        host_page_ids = torch.tensor(host_pages, dtype=torch.int64)
         try:
             with torch.cuda.stream(self.stream):
                 self.stream.wait_stream(torch.cuda.current_stream(self.device_pool.device))
                 start_event = torch.cuda.Event(enable_timing=True)
                 start_event.record(self.stream)
                 self._gather_device_pages(device_page_ids, packed_device)
-                if self._are_consecutive(host_pages):
+                if host_is_consecutive:
                     host_destination = host_pool.page_buffer[
                         host_pages[0] : host_pages[0] + len(host_pages)
                     ]
                     host_destination.copy_(packed_device, non_blocking=True)
                 else:
-                    packed_host.copy_(packed_device, non_blocking=True)
+                    assert workspace.host is not None
+                    workspace.host[:transfer_pages].copy_(packed_device, non_blocking=True)
                 event = torch.cuda.Event(enable_timing=True)
                 event.record(self.stream)
             submitted_at = time.perf_counter()
 
             publish = None
-            if not self._are_consecutive(host_pages):
+            if not host_is_consecutive:
+                assert workspace.host is not None
+                host_buffer = workspace.host[:transfer_pages]
+                host_page_ids = torch.tensor(host_pages, dtype=torch.int64)
 
                 def publish() -> None:
-                    host_pool.page_buffer.index_copy_(0, host_page_ids, packed_host)
+                    host_pool.page_buffer.index_copy_(0, host_page_ids, host_buffer)
 
             return self._cuda_ticket(
                 TransferDirection.D2H,
@@ -580,22 +608,26 @@ class CacheTransferManager:
 
         workspace_started_at = time.perf_counter()
         transfer_pages = len(host_pages)
-        workspace, workspace_created = self._acquire_workspace(transfer_pages)
+        host_is_consecutive = self._are_consecutive(host_pages)
+        workspace, workspace_created = self._acquire_workspace(
+            transfer_pages, needs_host=not host_is_consecutive
+        )
         workspace_setup_seconds = (
             time.perf_counter() - workspace_started_at if workspace_created else 0.0
         )
-        packed_host = workspace.host[:transfer_pages]
         packed_device = workspace.device[:transfer_pages]
-        host_page_ids = torch.tensor(host_pages, dtype=torch.int64)
         device_page_ids = torch.tensor(
             device_pages, dtype=torch.int64, device=self.device_pool.device
         )
         try:
-            if self._are_consecutive(host_pages):
+            if host_is_consecutive:
                 host_source = host_pool.page_buffer[host_pages[0] : host_pages[0] + len(host_pages)]
             else:
-                torch.index_select(host_pool.page_buffer, 0, host_page_ids, out=packed_host)
-                host_source = packed_host
+                assert workspace.host is not None
+                host_buffer = workspace.host[:transfer_pages]
+                host_page_ids = torch.tensor(host_pages, dtype=torch.int64)
+                torch.index_select(host_pool.page_buffer, 0, host_page_ids, out=host_buffer)
+                host_source = host_buffer
             with torch.cuda.stream(self.stream):
                 # device_page_ids is produced on the caller's current stream.  Triton
                 # consumes it directly, so make the transfer stream wait for that
@@ -700,7 +732,9 @@ class CacheTransferManager:
             state=TransferState.COMPLETED,
         )
 
-    def _acquire_workspace(self, pages: int) -> tuple[_PackedPageWorkspace, bool]:
+    def _acquire_workspace(
+        self, pages: int, *, needs_host: bool
+    ) -> tuple[_PackedPageWorkspace, bool]:
         with self._workspace_lock:
             candidates = [
                 workspace
@@ -710,34 +744,52 @@ class CacheTransferManager:
             if candidates:
                 workspace = min(candidates, key=lambda item: item.pages)
                 workspace.busy = True
-                return workspace, False
-            shape = (
-                pages,
-                2,
-                self.device_pool.num_layers,
-                self.page_size,
-                self.device_pool.local_kv_heads,
-                self.device_pool.head_dim,
-            )
+                host_created = needs_host and workspace.host is None
+                if host_created:
+                    workspace.host = self._empty_host(workspace.pages)
+                return workspace, host_created
             workspace = _PackedPageWorkspace(
                 pages=pages,
-                host=torch.empty(
-                    shape, dtype=self.device_pool.dtype, device="cpu", pin_memory=True
-                ),
-                device=torch.empty(
-                    shape, dtype=self.device_pool.dtype, device=self.device_pool.device
-                ),
+                device=self._empty_device(pages),
                 busy=True,
+                host=self._empty_host(pages) if needs_host else None,
             )
             self._workspaces.append(workspace)
             return workspace, True
+
+    def _packed_shape(self, pages: int) -> tuple[int, ...]:
+        return (
+            pages,
+            2,
+            self.device_pool.num_layers,
+            self.page_size,
+            self.device_pool.local_kv_heads,
+            self.device_pool.head_dim,
+        )
+
+    def _empty_device(self, pages: int) -> torch.Tensor:
+        return torch.empty(
+            self._packed_shape(pages),
+            dtype=self.device_pool.dtype,
+            device=self.device_pool.device,
+        )
+
+    def _empty_host(self, pages: int) -> torch.Tensor:
+        return torch.empty(
+            self._packed_shape(pages),
+            dtype=self.device_pool.dtype,
+            device="cpu",
+            pin_memory=True,
+        )
 
     def _release_workspace(self, workspace: _PackedPageWorkspace) -> None:
         with self._workspace_lock:
             workspace.busy = False
             idle = [item for item in self._workspaces if not item.busy]
             if len(idle) > 1:
-                keep = max(idle, key=lambda item: item.pages)
+                # Keep the largest idle workspace, preferring one that already owns a
+                # pinned page-packed buffer so its allocation is not thrown away.
+                keep = max(idle, key=lambda item: (item.pages, item.host is not None))
                 self._workspaces = [item for item in self._workspaces if item.busy or item is keep]
 
     def _autotune_copy_backends(self) -> None:

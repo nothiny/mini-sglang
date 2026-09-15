@@ -103,6 +103,29 @@ def test_triton_scatter_waits_for_page_ids_producer_stream():
     transfers.shutdown()
 
 
+def test_host_workspace_is_allocated_only_for_fragmented_pages():
+    device = _make_device_pool(num_pages=16, page_size=1)
+    host = HostMHAKVCache.from_device_pool(device, device.num_pages)
+    transfers = CacheTransferManager(device, host, None, staging_pages=2, copy_backend="torch")
+    device_indices = torch.arange(device.num_pages, device="cuda")
+    host_indices = device_indices.to(device="cpu", dtype=torch.int32)
+
+    # Contiguous host pages read/write the pinned L2 pool directly, so the expensive
+    # pinned packing buffer is never allocated.
+    transfers.device_to_host(device_indices, host_indices).wait()
+    transfers.host_to_device(host_indices, device_indices).wait()
+    assert transfers._workspaces[0].host is None
+
+    # Fragmented host pages need a packed gather/scatter buffer, which is allocated
+    # lazily and then retained for reuse.
+    reversed_host = torch.arange(device.num_pages - 1, -1, -1, dtype=torch.int32)
+    transfers.device_to_host(device_indices, reversed_host).wait()
+    assert transfers._workspaces[0].host is not None
+    transfers.device_to_host(device_indices, reversed_host).wait()
+    assert len(transfers._workspaces) == 1
+    transfers.shutdown()
+
+
 @pytest.mark.parametrize("page_size", [1, 2, 4])
 def test_cache_manager_restores_l3_after_l1_and_l2_eviction(tmp_path, page_size: int):
     num_pages = 6

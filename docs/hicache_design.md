@@ -75,7 +75,9 @@ transfer performs:
 H2D reverses the pipeline: gather fragmented host pages once, issue one DMA, and use one
 Triton launch to scatter into arbitrary GPU pages. Consecutive host allocations bypass the
 CPU gather/scatter entirely. The allocator keeps free lists sorted to make this fast path
-common.
+common. The page-major pinned packing buffer is allocated lazily and only when host pages are
+actually fragmented, so contiguous transfers read and write the pinned L2 pool directly and a
+cold prefix never pays an avoidable `cudaHostAlloc` on the critical path.
 
 The Triton kernels flatten the full page payload and map each logical packed offset to:
 
