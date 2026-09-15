@@ -1,6 +1,8 @@
 from __future__ import annotations
+
 from dataclasses import dataclass
 from typing import Any, Dict
+
 from transformers import PretrainedConfig
 
 
@@ -32,10 +34,24 @@ class ModelConfig:
     norm_topk_prob: bool
     model_type: str
     architectures: list[str]
+    # MLA (DeepSeek-V2/V3). None for MHA/GQA models.
+    q_lora_rank: int | None = None
+    kv_lora_rank: int | None = None
+    qk_nope_head_dim: int | None = None
+    qk_rope_head_dim: int | None = None
+    v_head_dim: int | None = None
+    # DeepSeek MoE
+    n_shared_experts: int = 0
+    first_k_dense_replace: int = 0
+    moe_layer_freq: int = 1
 
     @property
     def is_moe(self) -> bool:
         return "moe" in self.model_type
+
+    @property
+    def is_mla(self) -> bool:
+        return self.kv_lora_rank is not None
 
     @classmethod
     def from_hf(cls, config: PretrainedConfig) -> ModelConfig:
@@ -47,7 +63,9 @@ class ModelConfig:
                     setattr(config, attr, getattr(top, attr))
 
         num_kv_heads = getattr(config, "num_key_value_heads", config.num_attention_heads)
-        head_dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
+        head_dim = (
+            getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
+        )
         tie_word_embeddings = getattr(config, "tie_word_embeddings", False)
         model_type = getattr(config, "model_type", "llama")
         num_experts = getattr(config, "num_local_experts", getattr(config, "num_experts", 0))
@@ -55,6 +73,14 @@ class ModelConfig:
         moe_intermediate_size = getattr(config, "moe_intermediate_size", 0)
         norm_topk_prob = getattr(config, "norm_topk_prob", False)
         architectures = getattr(config, "architectures", ["LlamaForCausalLM"])
+        q_lora_rank = getattr(config, "q_lora_rank", None)
+        kv_lora_rank = getattr(config, "kv_lora_rank", None)
+        qk_nope_head_dim = getattr(config, "qk_nope_head_dim", None)
+        qk_rope_head_dim = getattr(config, "qk_rope_head_dim", None)
+        v_head_dim = getattr(config, "v_head_dim", None)
+        n_shared_experts = getattr(config, "n_shared_experts", 0)
+        first_k_dense_replace = getattr(config, "first_k_dense_replace", 0)
+        moe_layer_freq = getattr(config, "moe_layer_freq", 1)
 
         # Llama/Qwen: rope_theta is a direct attr; Mistral: it's inside rope_scaling dict
         rope_scaling = getattr(config, "rope_scaling", None)
@@ -84,4 +110,12 @@ class ModelConfig:
             norm_topk_prob=norm_topk_prob,
             model_type=model_type,
             architectures=architectures,
+            q_lora_rank=q_lora_rank,
+            kv_lora_rank=kv_lora_rank,
+            qk_nope_head_dim=qk_nope_head_dim,
+            qk_rope_head_dim=qk_rope_head_dim,
+            v_head_dim=v_head_dim,
+            n_shared_experts=n_shared_experts,
+            first_k_dense_replace=first_k_dense_replace,
+            moe_layer_freq=moe_layer_freq,
         )

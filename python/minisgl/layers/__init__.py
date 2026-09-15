@@ -9,6 +9,7 @@ from .linear import (
     LinearReplicated,
     LinearRowParallel,
 )
+from .mla import MLAttention, mla_attention_absorbed, mla_attention_naive
 from .moe import MoELayer
 from .norm import RMSNorm, RMSNormFused
 from .rotary import get_rope, set_rope_device
@@ -32,4 +33,7 @@ __all__ = [
     "set_rope_device",
     "LinearReplicated",
     "MoELayer",
+    "MLAttention",
+    "mla_attention_absorbed",
+    "mla_attention_naive",
 ]
