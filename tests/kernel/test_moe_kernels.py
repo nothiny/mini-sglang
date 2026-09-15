@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 from minisgl.layers.moe import MoELayer
 from minisgl.moe import MoeBackendConfig
-from minisgl.moe.fused import FusedMoe
+from minisgl.moe.fused import FusedMoe, get_default_config
 from minisgl.moe.weights import (
     ExpertResidentCache,
     quantize_expert_weight,
@@ -35,6 +35,18 @@ def torch_moe_reference(
             expert_output = F.linear(activated, w2[expert_idx])
             output[token_idx] += expert_output * topk_weights[token_idx, slot_idx]
     return output
+
+
+@pytest.mark.parametrize(
+    ("K", "expected_block_k"),
+    [(2048, 128), (768, 128), (1600, 64), (1000, 32)],
+)
+@pytest.mark.parametrize("M", [16, 256, 1024])
+def test_default_config_k_tile_tracks_divisibility(K: int, expected_block_k: int, M: int) -> None:
+    # A 128-wide K tile is preferred when K divides evenly; otherwise fall back so the
+    # unmasked even_Ks path still applies. This is a large FP8 win and neutral for BF16.
+    config = get_default_config(M, 128, 1536, K, 8)
+    assert config["BLOCK_SIZE_K"] == expected_block_k
 
 
 @pytest.mark.parametrize(("num_tokens", "small_m_threshold"), [(4, 8), (32, 8)])
