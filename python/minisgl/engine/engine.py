@@ -147,14 +147,24 @@ class Engine:
 
     def _determine_num_pages(self, old_free_memory: int, config: EngineConfig) -> int:
         new_free_memory = self._sync_get_memory()[1]
-        cache_per_page = (
-            2  # key + value
-            * config.model_config.head_dim
-            * div_even(config.model_config.num_kv_heads, config.tp_info.size, allow_replicate=True)
-            * config.page_size
-            * self.dtype.itemsize
-            * config.model_config.num_layers
-        )
+        if config.model_config.is_mla:
+            cache_per_page = (
+                (config.model_config.kv_lora_rank + config.model_config.qk_rope_head_dim)
+                * self.dtype.itemsize
+                * config.model_config.num_layers
+                * config.page_size
+            )
+        else:
+            cache_per_page = (
+                2  # key + value
+                * config.model_config.head_dim
+                * div_even(
+                    config.model_config.num_kv_heads, config.tp_info.size, allow_replicate=True
+                )
+                * config.page_size
+                * self.dtype.itemsize
+                * config.model_config.num_layers
+            )
         num_pages = config.num_page_override
         if num_pages is None:
             model_memory = old_free_memory - new_free_memory
@@ -227,6 +237,11 @@ def _adjust_config(config: EngineConfig):
     if "trtllm" in config.attention_backend and config.page_size not in [16, 32, 64]:
         override("page_size", 64)
         logger.warning_rank0("Page size is overridden to 64 for TRTLLM backend")
+
+    if config.model_config.is_mla and (config.cuda_graph_bs != [] or config.cuda_graph_max_bs != 0):
+        override("cuda_graph_bs", [])
+        override("cuda_graph_max_bs", 0)
+        logger.warning_rank0("CUDA graphs are disabled for MLA attention.")
 
     if config.model_config.is_moe and config.moe_backend == "auto":
         override("moe_backend", "fused")

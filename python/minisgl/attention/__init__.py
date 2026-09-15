@@ -53,6 +53,10 @@ def create_attention_backend(
     backend: str,
     config: ModelConfig,
 ) -> BaseAttnBackend:
+    if config.is_mla:
+        from .mla import MLAttentionBackend
+
+        return MLAttentionBackend(config)
     validate_attn_backend(backend, allow_auto=False)
     if "," in backend:
         assert backend.count(",") == 1, "Only one comma is allowed in hybrid backend"

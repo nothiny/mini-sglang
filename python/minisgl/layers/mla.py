@@ -65,6 +65,37 @@ def mla_attention_naive(
     return torch.einsum("hts,shv->thv", probs, v)
 
 
+def mla_latent(
+    q_abs: torch.Tensor,
+    q_pe: torch.Tensor,
+    c_kv: torch.Tensor,
+    k_pe: torch.Tensor,
+    sm_scale: float,
+    *,
+    causal: bool = True,
+) -> torch.Tensor:
+    """Absorbed attention over the latent, before the ``w_uv`` output projection.
+
+    ``q_abs`` is the already-absorbed query ([T, H, kv_lora_rank]). The result is
+    ``z`` [T, H, kv_lora_rank]; this is exactly what FlashInfer's
+    ``BatchMLAPagedAttentionWrapper.run`` returns.
+    """
+
+    num_heads = q_abs.shape[1]
+    num_kv = c_kv.shape[0]
+    q = torch.cat([q_abs, q_pe], dim=-1)
+    k = torch.cat(
+        [
+            c_kv[:, None, :].expand(num_kv, num_heads, -1),
+            k_pe[:, None, :].expand(num_kv, num_heads, -1),
+        ],
+        dim=-1,
+    )
+    scores = torch.einsum("thd,shd->hts", q, k) * sm_scale
+    probs = _softmax(_causal_scores(scores, causal), q.dtype)
+    return torch.einsum("hts,sr->thr", probs, c_kv)
+
+
 def mla_attention_absorbed(
     q_nope: torch.Tensor,
     q_pe: torch.Tensor,
@@ -78,20 +109,8 @@ def mla_attention_absorbed(
 ) -> torch.Tensor:
     """Fold ``w_uk`` into the query and ``w_uv`` into the output; attend on the latent."""
 
-    num_heads = q_nope.shape[1]
-    num_kv = c_kv.shape[0]
     q_abs = torch.einsum("hnr,thn->thr", w_uk, q_nope)
-    q = torch.cat([q_abs, q_pe], dim=-1)
-    k = torch.cat(
-        [
-            c_kv[:, None, :].expand(num_kv, num_heads, -1),
-            k_pe[:, None, :].expand(num_kv, num_heads, -1),
-        ],
-        dim=-1,
-    )
-    scores = torch.einsum("thd,shd->hts", q, k) * sm_scale
-    probs = _softmax(_causal_scores(scores, causal), q.dtype)
-    z = torch.einsum("hts,sr->thr", probs, c_kv)
+    z = mla_latent(q_abs, q_pe, c_kv, k_pe, sm_scale, causal=causal)
     return torch.einsum("hvr,thr->thv", w_uv, z)
 
 
@@ -164,10 +183,17 @@ class MLAttention(BaseOP):
         *,
         causal: bool,
     ) -> torch.Tensor:
+        from minisgl.core import try_get_global_ctx
+
         w_uk, w_uv = self._split_kv_b()
-        return mla_attention_absorbed(
-            q_nope, q_pe, c_kv, k_pe, w_uk, w_uv, self.sm_scale, causal=causal
-        )
+        q_abs = torch.einsum("hnr,thn->thr", w_uk, q_nope)
+        ctx = try_get_global_ctx()
+        backend = ctx.attn_backend if ctx is not None else None
+        if backend is not None and hasattr(backend, "forward_mla"):
+            z = backend.forward_mla(q_abs, q_pe, c_kv, k_pe, self.layer_id, ctx.batch)
+        else:
+            z = mla_latent(q_abs, q_pe, c_kv, k_pe, self.sm_scale, causal=causal)
+        return torch.einsum("hvr,thr->thv", w_uv, z)
 
     def forward(
         self,
@@ -200,4 +226,4 @@ class MLAttention(BaseOP):
         return self.o_proj.forward(o.reshape(num_tokens, self.num_heads * self.v_head))
 
 
-__all__ = ["MLAttention", "mla_attention_absorbed", "mla_attention_naive"]
+__all__ = ["MLAttention", "mla_attention_absorbed", "mla_attention_naive", "mla_latent"]

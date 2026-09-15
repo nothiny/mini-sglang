@@ -170,3 +170,131 @@ def test_mlattention_matches_hf_deepseek_attention() -> None:
             batch, attention_mask=causal_mask, position_embeddings=position_embeddings
         )
         assert torch.allclose(ours_causal, reference_causal.view(seq, hidden), atol=2e-2, rtol=2e-2)
+
+
+def _mla_model_config(
+    *,
+    hidden: int,
+    num_heads: int,
+    qk_nope: int,
+    qk_rope: int,
+    v_head: int,
+    rank: int,
+    num_layers: int = 1,
+):
+    from minisgl.models.config import ModelConfig, RotaryConfig
+
+    return ModelConfig(
+        num_layers=num_layers,
+        num_qo_heads=num_heads,
+        num_kv_heads=num_heads,
+        head_dim=qk_nope + qk_rope,
+        hidden_size=hidden,
+        vocab_size=128,
+        intermediate_size=hidden,
+        rms_norm_eps=1e-6,
+        rotary_config=RotaryConfig(qk_nope + qk_rope, qk_nope + qk_rope, 64, 10000.0, None),
+        hidden_act="silu",
+        tie_word_embeddings=False,
+        num_experts=0,
+        num_experts_per_tok=0,
+        moe_intermediate_size=0,
+        norm_topk_prob=False,
+        model_type="deepseek_v2",
+        architectures=["DeepseekV2ForCausalLM"],
+        q_lora_rank=None,
+        kv_lora_rank=rank,
+        qk_nope_head_dim=qk_nope,
+        qk_rope_head_dim=qk_rope,
+        v_head_dim=v_head,
+    )
+
+
+def test_create_kvcache_pool_routes_mla() -> None:
+    from minisgl.kvcache import create_kvcache_pool
+    from minisgl.kvcache.mla_pool import MLAKVCache
+
+    config = _mla_model_config(hidden=64, num_heads=4, qk_nope=128, qk_rope=64, v_head=128, rank=32)
+    pool = create_kvcache_pool(
+        config, num_pages=8, page_size=1, dtype=torch.bfloat16, device=torch.device("cpu")
+    )
+    assert isinstance(pool, MLAKVCache)
+    assert pool.ckv_cache(0).shape == (8, 32)
+    assert pool.kpe_cache(0).shape == (8, 64)
+    assert pool.bytes_per_page == (32 + 64) * torch.bfloat16.itemsize * 1
+
+
+def test_mla_paged_attention_matches_reference() -> None:
+    from flashinfer.mla import BatchMLAPagedAttentionWrapper
+
+    from minisgl.kvcache.mla_pool import MLAKVCache
+
+    torch.manual_seed(0)
+    device = "cuda"
+    num_heads, qk_nope, qk_rope, v_head, rank = 16, 128, 64, 128, 256
+    sm_scale = (qk_nope + qk_rope) ** -0.5
+    dtype = torch.bfloat16
+    num_pages = 32
+
+    pool = MLAKVCache(
+        num_layers=1,
+        num_pages=num_pages,
+        page_size=1,
+        kv_lora_rank=rank,
+        qk_rope_head_dim=qk_rope,
+        dtype=dtype,
+        device=torch.device(device),
+    )
+    w_uk = torch.randn(num_heads, qk_nope, rank, dtype=dtype, device=device) * 0.05
+    w_uv = torch.randn(num_heads, v_head, rank, dtype=dtype, device=device) * 0.05
+    wrapper = BatchMLAPagedAttentionWrapper(
+        torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device), backend="fa2"
+    )
+
+    def run_paged(q_nope, q_pe, kv_len, q_len):
+        q_abs = torch.einsum("hnr,thn->thr", w_uk, q_nope)
+        qo_indptr = torch.tensor([0, q_len], dtype=torch.int32, device=device)
+        kv_indptr = torch.tensor([0, kv_len], dtype=torch.int32, device=device)
+        kv_indices = torch.arange(kv_len, dtype=torch.int32, device=device)
+        kv_len_arr = torch.tensor([kv_len], dtype=torch.int32, device=device)
+        wrapper.plan(
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_len_arr,
+            num_heads,
+            rank,
+            qk_rope,
+            1,
+            True,
+            sm_scale,
+            dtype,
+            dtype,
+        )
+        ckv = pool.ckv_cache(0).view(-1, 1, rank)
+        kpe = pool.kpe_cache(0).view(-1, 1, qk_rope)
+        z = wrapper.run(q_abs, q_pe, ckv, kpe)
+        return torch.einsum("hvr,thr->thv", w_uv, z)
+
+    # prefill: q_len == kv_len
+    prefix = 6
+    c_kv = torch.randn(prefix, rank, dtype=dtype, device=device)
+    k_pe = torch.randn(prefix, qk_rope, dtype=dtype, device=device)
+    pool.store_mla(c_kv, k_pe, torch.arange(prefix, device=device), 0)
+    q_nope = torch.randn(prefix, num_heads, qk_nope, dtype=dtype, device=device)
+    q_pe = torch.randn(prefix, num_heads, qk_rope, dtype=dtype, device=device)
+    ours = run_paged(q_nope, q_pe, prefix, prefix)
+    ref = mla_attention_absorbed(q_nope, q_pe, c_kv, k_pe, w_uk, w_uv, sm_scale)
+    assert torch.allclose(ours, ref, atol=3e-2, rtol=3e-2)
+
+    # decode: one new token appended to the cache
+    c_new = torch.randn(1, rank, dtype=dtype, device=device)
+    k_new = torch.randn(1, qk_rope, dtype=dtype, device=device)
+    pool.store_mla(c_new, k_new, torch.tensor([prefix], device=device), 0)
+    q_nope = torch.randn(1, num_heads, qk_nope, dtype=dtype, device=device)
+    q_pe = torch.randn(1, num_heads, qk_rope, dtype=dtype, device=device)
+    ours = run_paged(q_nope, q_pe, prefix + 1, 1)
+    ref = mla_attention_absorbed(
+        q_nope, q_pe, torch.cat([c_kv, c_new]), torch.cat([k_pe, k_new]), w_uk, w_uv, sm_scale
+    )
+    assert torch.allclose(ours, ref, atol=3e-2, rtol=3e-2)

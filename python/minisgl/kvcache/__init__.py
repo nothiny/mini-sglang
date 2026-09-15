@@ -31,6 +31,19 @@ def create_kvcache_pool(
     dtype: torch.dtype,
     device: torch.device,
 ) -> BaseKVCachePool:
+    if model_config.is_mla:
+        from .mla_pool import MLAKVCache
+
+        return MLAKVCache(
+            num_layers=model_config.num_layers,
+            num_pages=num_pages,
+            page_size=page_size,
+            kv_lora_rank=model_config.kv_lora_rank,
+            qk_rope_head_dim=model_config.qk_rope_head_dim,
+            device=device,
+            dtype=dtype,
+        )
+
     from .mha_pool import MHAKVCache  # TODO: support other variants (e.g. MLA)
 
     return MHAKVCache(

@@ -1,6 +1,6 @@
 # Mini-MLA Design
 
-Status: Design. Not implemented yet.
+Status: M0-M2 implemented. See section 10 for per-milestone status.
 
 Mini-MLA adds Multi-head Latent Attention (MLA) to Mini-SGLang so it can run
 DeepSeek-V2-style models. It is the attention half of a future **Mini-DeepSeek**
@@ -109,15 +109,16 @@ Current MHA pool (`kvcache/mha_pool.py`):
 [2, layers, pages, page_size, local_kv_heads, head_dim]
 ```
 
-The MLA pool stores one contiguous record per token:
+`MLAKVCache` keeps two buffers, because FlashInfer's
+`BatchMLAPagedAttentionWrapper` takes the latent and the rope key separately:
 
 ```text
-[layers, pages, page_size, kv_lora_rank + qk_rope_head_dim]
+ckv: [layers, tokens, kv_lora_rank]
+kpe: [layers, tokens, qk_rope_head_dim]
 ```
 
-This matches FlashInfer's MLA page layout, which expects the last dimension to be
-`head_dim_ckv + head_dim_kpe`. Page size 1 initially, matching the rest of the
-engine; later page sizes are a pure indexing change.
+Page size 1 initially, matching the rest of the engine; later page sizes are a
+pure indexing change. `store_mla(c_KV, k_pe, out_loc, layer_id)` writes both.
 
 Per page (page_size = 1, BF16): `576 * 2 = 1152` bytes. The engine's KV sizing
 (`engine.py::_get_kv_bytes_per_token`) becomes layout-aware:
@@ -132,12 +133,15 @@ mla_bytes_per_token = (kv_lora_rank + qk_rope_head_dim) * itemsize * layers
 FlashInfer 0.6.17 already ships what we need:
 
 - `flashinfer.mla.BatchMLAPagedAttentionWrapper` for the **absorbed** paged path
-  (decode and incremental prefill). Inputs: `q_nope` `[tokens, heads,
-  kv_lora_rank]`, `q_pe` `[tokens, heads, qk_rope_head_dim]`, and the fused paged
-  cache `[pages, page_size, kv_lora_rank + qk_rope_head_dim]`.
-- `flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper` for the **naive**
-  prefill path (`head_dim_qk = qk_nope + qk_rope = 192`,
-  `head_dim_vo = v_head_dim = 128`).
+  (both decode and prefill; the former "naive prefill" path is not needed). Its
+  `q_nope` input is the already-absorbed query `q_abs` `[tokens, heads,
+  kv_lora_rank]`, it reads the two caches above, and it returns the latent
+  output `z` `[tokens, heads, kv_lora_rank]`. The layer then applies `W_UV` and
+  `W_O`. The caller still uses `sm_scale = (qk_nope + qk_rope) ** -0.5`, i.e. the
+  head dimension before absorption.
+- `flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper` (naive,
+  `head_dim_qk = 192`, `head_dim_vo = 128`) is kept only as a possible future
+  prefill path; it is not wired in.
 
 A `MLAttentionBackend` wraps these and mirrors the existing `BaseAttnBackend`
 metadata/capture lifecycle (`attention/base.py`, `attention/fi.py`). Because the
@@ -258,14 +262,14 @@ Sharding rules:
 
 ## 10. Milestones
 
-| # | Deliverable | Acceptance |
-|---|---|---|
-| M0 | MLA math + torch reference (unpaged) | absorbed == naive; reference matches HF attention math |
-| M1 | `MLAttentionLayer`, `MLAKVCache`, synthetic model | tiny model forward matches reference |
-| M2 | Paged MLA via FlashInfer (decode + prefill), radix integration | token match; page layout tests; `check_integrity()` |
-| M3 | DeepSeek-V2-Lite attention weights, TP, CUDA graph | per-layer attention matches `transformers`; graph replay works |
-| M4 | Benchmarks + docs | KV bytes/token, max context, decode tokens/s tables |
-| M5 | Mini-DeepSeek: shared experts + MoE + FP8/offload | full V2-Lite token match vs `transformers`; single-GPU run |
+| # | Deliverable | Acceptance | Status |
+|---|---|---|---|
+| M0 | MLA math + torch reference (unpaged) | absorbed == naive; reference matches HF attention math | done |
+| M1 | `MLAttention`, `MLAKVCache`, synthetic model | tiny model forward matches reference | done (`MLAttention` == HF attention) |
+| M2 | Paged MLA via FlashInfer, radix integration | token match; page layout tests; `check_integrity()` | done (paged == reference; engine E2E) |
+| M3 | DeepSeek-V2-Lite attention weights, TP, CUDA graph | per-layer attention matches `transformers`; graph replay works | not started (CUDA graph deferred) |
+| M4 | Benchmarks + docs | KV bytes/token, max context, decode tokens/s tables | not started |
+| M5 | Mini-DeepSeek: shared experts + MoE + FP8/offload | full V2-Lite token match vs `transformers`; single-GPU run | `mini-deepseek` branch |
 
 M0-M2 are the `mini-mla` branch. M5 is the `mini-deepseek` branch that merges
 `mini-mla` and `mini-moe`.

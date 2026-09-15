@@ -134,3 +134,7 @@ def set_global_ctx(ctx: Context):
 def get_global_ctx() -> Context:
     assert _GLOBAL_CTX is not None, "Global context is not set"
     return _GLOBAL_CTX
+
+
+def try_get_global_ctx() -> Context | None:
+    return _GLOBAL_CTX
