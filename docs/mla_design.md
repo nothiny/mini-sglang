@@ -267,20 +267,27 @@ Sharding rules:
 | M0 | MLA math + torch reference (unpaged) | absorbed == naive; reference matches HF attention math | done |
 | M1 | `MLAttention`, `MLAKVCache`, synthetic model | tiny model forward matches reference | done (`MLAttention` == HF attention) |
 | M2 | Paged MLA via FlashInfer, radix integration | token match; page layout tests; `check_integrity()` | done (paged == reference; engine E2E) |
-| M3 | DeepSeek-V2-Lite attention weights, TP, CUDA graph | per-layer attention matches `transformers`; graph replay works | not started (CUDA graph deferred) |
-| M4 | Benchmarks + docs | KV bytes/token, max context, decode tokens/s tables | not started |
+| M3 | DeepSeek-V2-Lite attention weights, TP, CUDA graph | per-layer attention matches `transformers`; graph replay works | attention-level done; TP/graph not started |
+| M4 | Benchmarks + docs | KV bytes/token, max context, decode tokens/s tables | done (`bench_mla.py`) |
 | M5 | Mini-DeepSeek: shared experts + MoE + FP8/offload | full V2-Lite token match vs `transformers`; single-GPU run | `mini-deepseek` branch |
 
 M0-M2 are the `mini-mla` branch. M5 is the `mini-deepseek` branch that merges
 `mini-mla` and `mini-moe`.
 
-## 11. Metrics
+## 11. Metrics and measured results
 
-- KV bytes/token and pages: MLA vs the MHA-equivalent (expected ~8.9x).
-- Maximum context length and concurrent requests at a fixed VRAM budget.
-- Decode latency / tokens-per-second at several batch sizes and context lengths.
-- Prefill latency, naive vs absorbed.
-- Correctness: exact token match against `transformers`; attention-output max error.
+| Metric | Result |
+|---|---|
+| KV bytes/token (V2-Lite, bf16) | MLA 31,104 vs MHA-equivalent 276,480 (**8.89x**) |
+| Max context from 12 GiB KV | MLA 414,252 tokens vs MHA 46,603 |
+| Paged absorbed decode (RTX 5070) | ctx 512 / 2048 / 8192 / 32768 -> 41 / 53 / 84 / 242 us |
+| `MLAttention` vs HF, real layer-0 weights | max diff 2.6e-3, mean 1e-4 (bf16) |
+| `mla_attention_naive` vs `absorbed` | <= 2e-6 |
+| Paged backend vs unpaged reference | bf16-level agreement |
+
+`benchmark/offline/bench_mla.py` emits the memory and decode numbers as one
+`MLA_BENCHMARK_RESULT=<json>` record. End-to-end tokens/s and prefill latency
+need the MoE and are left to the mini-deepseek milestone.
 
 ## 12. Risks
 

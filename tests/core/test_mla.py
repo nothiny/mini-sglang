@@ -298,3 +298,96 @@ def test_mla_paged_attention_matches_reference() -> None:
         q_nope, q_pe, torch.cat([c_kv, c_new]), torch.cat([k_pe, k_new]), w_uk, w_uv, sm_scale
     )
     assert torch.allclose(ours, ref, atol=3e-2, rtol=3e-2)
+
+
+_DEEPSEEK_V2_LITE = "/home/yzd/models/DeepSeek-V2-Lite"
+
+
+def test_mla_kv_bytes_per_token() -> None:
+    """V2-Lite caches (kv_lora_rank + qk_rope) per token per layer, ~8.9x less than
+    the MHA-equivalent (16 heads * (192 K + 128 V))."""
+    from minisgl.kvcache.mla_pool import MLAKVCache
+
+    layers, heads, nope, rope, v_head, rank = 27, 16, 128, 64, 128, 512
+    pool = MLAKVCache(
+        num_layers=layers,
+        num_pages=1,
+        page_size=1,
+        kv_lora_rank=rank,
+        qk_rope_head_dim=rope,
+        dtype=torch.bfloat16,
+        device=torch.device("cpu"),
+    )
+    mla_per_token = pool.bytes_per_page // layers
+    mha_per_token = heads * ((nope + rope) + v_head) * 2
+    assert mla_per_token == (rank + rope) * 2
+    assert mha_per_token == heads * ((nope + rope) + v_head) * 2
+    assert mha_per_token / mla_per_token > 8.8
+
+
+@pytest.mark.skipif(
+    not __import__("os").path.exists(_DEEPSEEK_V2_LITE),
+    reason="DeepSeek-V2-Lite checkpoint is not available",
+)
+def test_mlattention_matches_hf_with_real_deepseek_weights() -> None:
+    import json
+
+    from safetensors import safe_open
+    from transformers import AutoConfig
+    from transformers.models.deepseek_v2.modeling_deepseek_v2 import (
+        DeepseekV2Attention,
+        DeepseekV2RotaryEmbedding,
+    )
+
+    from minisgl.layers.mla import MLAttention
+    from minisgl.layers.rotary import set_rope_device
+    from minisgl.models.config import ModelConfig
+
+    device = "cuda"
+    hf_config = AutoConfig.from_pretrained(_DEEPSEEK_V2_LITE, trust_remote_code=False)
+    hf_config._attn_implementation = "eager"
+    config = ModelConfig.from_hf(hf_config)
+    assert config.is_mla
+
+    layer = 0
+    names = ["q_proj", "kv_a_proj_with_mqa", "kv_a_layernorm", "kv_b_proj", "o_proj"]
+    index = json.load(open(f"{_DEEPSEEK_V2_LITE}/model.safetensors.index.json"))["weight_map"]
+    tensors = {}
+    for name in names:
+        key = f"model.layers.{layer}.self_attn.{name}.weight"
+        with safe_open(f"{_DEEPSEEK_V2_LITE}/{index[key]}", framework="pt", device="cpu") as handle:
+            tensors[name] = handle.get_tensor(key).to(device)
+
+    hf_attn = DeepseekV2Attention(hf_config, layer_idx=layer).to(device).to(torch.bfloat16).eval()
+    with torch.no_grad():
+        for name in names:
+            getattr(hf_attn, name).weight.copy_(tensors[name])
+
+    set_rope_device(torch.device(device))
+    previous_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(torch.bfloat16)
+    try:
+        with torch.device(device):
+            attention = MLAttention(config, layer_id=layer)
+    finally:
+        torch.set_default_dtype(previous_dtype)
+    with torch.no_grad():
+        for name in names:
+            getattr(attention, name).weight.copy_(tensors[name])
+
+    seq = 16
+    hidden_states = torch.randn(seq, config.hidden_size, dtype=torch.bfloat16, device=device)
+    batch = hidden_states.unsqueeze(0)
+    positions = torch.arange(seq, dtype=torch.int32, device=device)
+    rotary = DeepseekV2RotaryEmbedding(hf_config).to(device)
+    position_embeddings = rotary(batch, positions.unsqueeze(0))
+    causal_mask = torch.full(
+        (1, 1, seq, seq), torch.finfo(torch.bfloat16).min, device=device, dtype=torch.bfloat16
+    ).triu(1)
+
+    with torch.no_grad():
+        ours = attention.forward(hidden_states, positions, causal=True)
+        reference, _ = hf_attn(
+            batch, attention_mask=causal_mask, position_embeddings=position_embeddings
+        )
+    assert torch.allclose(ours, reference.view(seq, config.hidden_size), atol=3e-2, rtol=3e-2)
