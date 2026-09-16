@@ -47,7 +47,7 @@ class ModelConfig:
 
     @property
     def is_moe(self) -> bool:
-        return "moe" in self.model_type
+        return self.num_experts > 0
 
     @property
     def is_mla(self) -> bool:
@@ -68,7 +68,11 @@ class ModelConfig:
         )
         tie_word_embeddings = getattr(config, "tie_word_embeddings", False)
         model_type = getattr(config, "model_type", "llama")
-        num_experts = getattr(config, "num_local_experts", getattr(config, "num_experts", 0))
+        num_experts = getattr(
+            config,
+            "n_routed_experts",
+            getattr(config, "num_local_experts", getattr(config, "num_experts", 0)),
+        )
         num_experts_per_tok = getattr(config, "num_experts_per_tok", 0)
         moe_intermediate_size = getattr(config, "moe_intermediate_size", 0)
         norm_topk_prob = getattr(config, "norm_topk_prob", False)

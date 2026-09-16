@@ -12,7 +12,7 @@ from minisgl.moe.weights import quantize_expert_weight, quantize_expert_weight_f
 from minisgl.utils import cached_load_hf_config, div_ceil, download_hf_weight
 from tqdm import tqdm
 
-_SPLIT_DIM_0 = [".q_proj", ".k_proj", ".v_proj", ".gate_proj", ".up_proj"]
+_SPLIT_DIM_0 = [".q_proj", ".k_proj", ".v_proj", ".gate_proj", ".up_proj", ".kv_b_proj"]
 _SPLIT_DIM_1 = [".o_proj", ".down_proj"]
 
 # Merge groups: individual projections -> fused projection
@@ -64,9 +64,15 @@ def _shard_tensor(
         return value
 
 
-def _get_merge_info(key: str):
-    """If key belongs to a merge group, return (merged_key, slot, all_slots). Else None."""
+def _get_merge_info(key: str, *, is_mla: bool = False):
+    """If key belongs to a merge group, return (merged_key, slot, all_slots). Else None.
+
+    MLA models have a standalone ``q_proj`` rather than a fused q/k/v projection,
+    so it must not be held back waiting for ``k_proj``/``v_proj``.
+    """
     for suffix, (fused_suffix, slots) in _MERGE_GROUPS.items():
+        if is_mla and suffix == ".q_proj":
+            continue
         if key.count(suffix):
             return key.replace(suffix, fused_suffix), _SLOT_NAMES[suffix], slots
     return None
@@ -184,7 +190,7 @@ def load_weight(model_path: str, device: torch.device) -> Iterator[Tuple[str, to
                 if not (stage_experts_on_cpu and expert_info is not None):
                     tensor = tensor.to(device)
 
-                if (info := _get_merge_info(name)) is None:
+                if (info := _get_merge_info(name, is_mla=getattr(config, "is_mla", False))) is None:
                     out = (name, tensor)
                 else:
                     merged_key, slot, all_slots = info
