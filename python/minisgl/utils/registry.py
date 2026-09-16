@@ -1,19 +1,20 @@
-from typing import Callable, Generic, Iterable, List, TypeVar
+from typing import Callable, Dict, Generic, Iterable, List, TypeVar
 
 T = TypeVar("T")
 
 
 class Registry(Generic[T]):
     def __init__(self, type: str):
-        self._registry = {}
+        self._registry: Dict[str, T] = {}
         self._type = type
 
-    def register(self, name: str) -> Callable[[T], None]:
+    def register(self, name: str) -> Callable[[T], T]:
         if name in self._registry:
             raise KeyError(f"{self._type} '{name}' is already registered.")
 
-        def decorator(item: T) -> None:
+        def decorator(item: T) -> T:
             self._registry[name] = item
+            return item
 
         return decorator
 

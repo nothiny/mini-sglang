@@ -62,7 +62,7 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         EngineConfig instance with parsed arguments
     """
     from minisgl.attention import validate_attn_backend
-    from minisgl.kvcache import SUPPORTED_CACHE_MANAGER
+    from minisgl.kvcache import SUPPORTED_CACHE_MANAGER, SUPPORTED_EVICTION_POLICIES
     from minisgl.moe import SUPPORTED_MOE_BACKENDS
 
     parser = argparse.ArgumentParser(description="MiniSGL Server Arguments")
@@ -204,6 +204,7 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
 
     parser.add_argument(
         "--cache-type",
+        "--cache",
         type=str,
         default=ServerArgs.cache_type,
         choices=SUPPORTED_CACHE_MANAGER.supported_names(),
@@ -211,10 +212,171 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     )
 
     parser.add_argument(
+        "--cache-eviction-policy",
+        type=str,
+        default=ServerArgs.cache_eviction_policy,
+        choices=SUPPORTED_EVICTION_POLICIES.supported_names(),
+        help="The victim-selection policy used by the Radix prefix cache.",
+    )
+
+    parser.add_argument(
+        "--eviction-k",
+        type=int,
+        default=ServerArgs.eviction_k,
+        help="Number of recent accesses retained by the lru-k policy.",
+    )
+
+    parser.add_argument(
+        "--eviction-half-life",
+        type=float,
+        default=ServerArgs.eviction_half_life,
+        help="Frequency/recency half-life in seconds for decay and cost-aware policies.",
+    )
+
+    parser.add_argument(
+        "--eviction-ghost-capacity",
+        type=int,
+        default=ServerArgs.eviction_ghost_capacity,
+        help="Maximum number of evicted prefix fingerprints retained for feedback.",
+    )
+
+    def parse_adaptive_experts(value: str) -> Tuple[str, ...]:
+        experts = tuple(name.strip() for name in value.split(",") if name.strip())
+        if not experts:
+            raise argparse.ArgumentTypeError("adaptive experts cannot be empty")
+        SUPPORTED_EVICTION_POLICIES.assert_supported(experts)
+        if "adaptive" in experts:
+            raise argparse.ArgumentTypeError("adaptive cannot contain itself as an expert")
+        if len(set(experts)) != len(experts):
+            raise argparse.ArgumentTypeError("adaptive expert names must be unique")
+        return experts
+
+    parser.add_argument(
+        "--adaptive-experts",
+        type=parse_adaptive_experts,
+        default=ServerArgs.adaptive_experts,
+        help="Comma-separated experts used by the adaptive policy.",
+    )
+
+    parser.add_argument(
+        "--adaptive-learning-rate",
+        type=float,
+        default=ServerArgs.adaptive_learning_rate,
+        help="Regret-learning rate used by the adaptive policy.",
+    )
+
+    parser.add_argument(
+        "--adaptive-seed",
+        type=int,
+        default=ServerArgs.adaptive_seed,
+        help="Random seed for reproducible adaptive expert selection.",
+    )
+
+    parser.add_argument(
         "--moe-backend",
         default=ServerArgs.moe_backend,
         choices=["auto"] + SUPPORTED_MOE_BACKENDS.supported_names(),
         help="The MoE backend to use.",
+    )
+
+    parser.add_argument(
+        "--disable-moe-workspace-cache",
+        action="store_false",
+        dest="moe_enable_workspace_cache",
+        help="Allocate temporary MoE tensors on every forward instead of reusing workspaces.",
+    )
+
+    parser.add_argument(
+        "--moe-small-m-threshold",
+        type=int,
+        default=ServerArgs.moe_small_m_threshold,
+        help="Use the decode-oriented direct expert kernel up to this token count.",
+    )
+
+    parser.add_argument(
+        "--moe-autotune",
+        action="store_true",
+        help="Profile MoE kernel paths and grouped configs once per shape and token bucket.",
+    )
+
+    parser.add_argument(
+        "--expert-parallel-size",
+        type=int,
+        default=ServerArgs.expert_parallel_size,
+        help="Shard experts across this many ranks; currently 1 or TP size.",
+    )
+
+    parser.add_argument(
+        "--disable-moe-communication-overlap",
+        action="store_false",
+        dest="moe_expert_parallel_overlap",
+        help="Wait for expert All-to-All before computing rank-local routes.",
+    )
+
+    parser.add_argument(
+        "--moe-expert-parallel-dispatch",
+        choices=("dynamic", "static"),
+        default=ServerArgs.moe_expert_parallel_dispatch,
+        help="Use compact dynamic EP messages or fixed device-side route buckets.",
+    )
+
+    parser.add_argument(
+        "--moe-expert-placement",
+        choices=("contiguous", "round-robin"),
+        default=ServerArgs.moe_expert_placement,
+        help="Map global experts to EP ranks contiguously or round-robin.",
+    )
+
+    def parse_replicated_experts(value: str) -> Tuple[int, ...]:
+        try:
+            expert_ids = tuple(int(item.strip()) for item in value.split(",") if item.strip())
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError("replicated expert IDs must be integers") from exc
+        if any(expert_id < 0 for expert_id in expert_ids):
+            raise argparse.ArgumentTypeError("replicated expert IDs must be non-negative")
+        if len(set(expert_ids)) != len(expert_ids):
+            raise argparse.ArgumentTypeError("replicated expert IDs must be unique")
+        return expert_ids
+
+    parser.add_argument(
+        "--moe-replicated-experts",
+        type=parse_replicated_experts,
+        default=ServerArgs.moe_replicated_experts,
+        help="Comma-separated hot expert IDs replicated on every EP rank.",
+    )
+
+    parser.add_argument(
+        "--moe-expert-quantization",
+        choices=("none", "int8", "fp8"),
+        default=ServerArgs.moe_expert_quantization,
+        help="Weight-only quantization used for MoE experts.",
+    )
+
+    parser.add_argument(
+        "--moe-expert-offload",
+        action="store_true",
+        help="Keep expert weights on CPU and load routed experts into a GPU LRU cache.",
+    )
+
+    parser.add_argument(
+        "--moe-expert-cache-size",
+        type=int,
+        default=ServerArgs.moe_expert_cache_size,
+        help="Number of experts retained per layer when CPU expert offload is enabled.",
+    )
+
+    parser.add_argument(
+        "--disable-moe-expert-offload-overlap",
+        action="store_false",
+        dest="moe_expert_offload_overlap",
+        help="Wait for an offload wave before computing instead of overlapping H2D and experts.",
+    )
+
+    parser.add_argument(
+        "--moe-expert-offload-wave-size",
+        type=int,
+        default=ServerArgs.moe_expert_offload_wave_size,
+        help="Number of newly loaded experts grouped per overlapped compute micro-wave.",
     )
 
     parser.add_argument(
@@ -263,6 +425,11 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     del kwargs["tensor_parallel_size"]
 
     result = ServerArgs(**kwargs)
+    try:
+        result.eviction_policy_config
+        result.moe_backend_config
+    except ValueError as error:
+        parser.error(str(error))
     logger = init_logger(__name__)
     logger.info(f"Parsed arguments:\n{result}")
     return result, run_shell
